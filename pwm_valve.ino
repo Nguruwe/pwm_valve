@@ -7,19 +7,20 @@
 // ================= НАСТРОЙКИ =================
 // --- Дисплей ---
 #define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+#define SCREEN_HEIGHT 32
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-const int DISPLAY_UPDATE_INTERVAL = 500; // мс, константа для обновления дисплея
+const int DISPLAY_UPDATE_INTERVAL = 200; // мс, для плавного мигания
 
 // --- Датчик температуры DS18B20 ---
 #define ONE_WIRE_BUS 2
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 const int TEMP_COMPARE_INTERVAL = 500; // мс, частота сравнения с установкой
+unsigned long lastTempRequest = 0;     // Время последнего запроса температуры
 
 // --- Кнопки ---
-const int BUTTON1_PIN = 3; // Кнопка 1: Автоматический режим (открыть и следить)
+const int BUTTON1_PIN = 3; // Кнопка 1: Автоматический режим / Перезахват / Показ SP
 const int BUTTON2_PIN = 4; // Кнопка 2: Ручной режим (триггер ШИМ)
 
 // --- Светодиод ---
@@ -32,8 +33,16 @@ const int HOLD_VALUE = 99;  // Мощность удержания (подбир
 const int PULL_TIME = 300;  // Время полной мощности для втягивания (мс)
 
 // --- Параметры управления ---
-const float TEMP_THRESHOLD = 0.1;  // Превышение для срабатывания (градусы)
-const float TEMP_HYSTERESIS = 0.0; // Гистерезис (пока 0, подберете позже)
+// Учитывая шаг датчика 0,0625, реальное завышение, на которое среагирует автоматика, составит 0,125(так как 0,0625 еще меньше 0,1, а следующий шаг — уже 0,125). 
+const float TEMP_THRESHOLD = 0.125;  // Превышение для срабатывания (градусы)
+const float TEMP_HYSTERESIS = 0.0; // Гистерезис
+
+// --- Константы для мигания и отображения SP ---
+const unsigned long FLASH_DURATION = 3000;    // Время мигания при включении/перезахвате AUTO (мс)
+const unsigned long FLASH_INTERVAL = 500;     // Интервал мигания (полупериод, мс)
+const unsigned long SHOW_SP_DURATION = 1000;   // Сколько времени показывать SP при коротком нажатии (мс)
+const unsigned long SHOW_SP_INTERVAL = 200;    // Скорость мигания при коротком просмотре (мс)
+const unsigned long LONG_PRESS_TIME = 1500;   // Время удержания кнопки для долгого нажатия (мс)
 
 // ================= ПЕРЕМЕННЫЕ СОСТОЯНИЯ =================
 float setpointTemp = 0.0;      // Запомненная температура при открытии клапана
@@ -46,6 +55,13 @@ bool lastButton2State = HIGH;
 
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastTempCompare = 0;
+
+// Таймеры для логики отображения и замера кнопок
+unsigned long autoModeStartTime = 0; // Время, когда включили режим AUTO (или перезахватили уставку)
+unsigned long showSpStartTime = 0;    // Время, когда запросили показ SP в режиме AUTO
+unsigned long button1PressStartTime = 0; // Время, когда кнопка 1 была зажата
+bool isButton1Depressed = false;     // Флаг того, что кнопка 1 удерживается
+bool longPressExecuted = false;      // Флаг, чтобы долгое нажатие не срабатывало циклически
 
 // ================= НАСТРОЙКА ШИМ (25 кГц) =================
 void setupHighFrequencyPWM() {
@@ -73,40 +89,57 @@ void turnSolenoidOff() {
   digitalWrite(LED_PIN, LOW);
 }
 
-// ================= ОБНОВЛЕНИЕ ДИСПЛЕЯ =================
+// ================= ОБНОВЛЕНИЕ ДИСПЛЕЯ (АДАПТИРОВАНО ПОД 128x32) =================
 void updateDisplay() {
   display.clearDisplay();
+  unsigned long now = millis();
   
-  // ---- Верхняя строка: температура (крупный шрифт) ----
+  bool isBlinkingStage = (isAutoMode && (now - autoModeStartTime < FLASH_DURATION));
+  bool isShowingSpStage = (isAutoMode && (now - showSpStartTime < SHOW_SP_DURATION));
+  
+  float tempToDisplay = currentTemp;
+  bool shouldRenderTemp = true;
+
+  if (isBlinkingStage) {
+    tempToDisplay = setpointTemp;
+    if ((now - autoModeStartTime) / FLASH_INTERVAL % 2 == 0) {
+      shouldRenderTemp = false; 
+    }
+  } else if (isShowingSpStage) {
+    tempToDisplay = setpointTemp;
+    if ((now - showSpStartTime) / SHOW_SP_INTERVAL % 2 == 0) {
+      shouldRenderTemp = false; 
+    }
+  }
+
+  // ---- Верхняя строка: температура (Размер 3 занимает 24 пикселя в высоту) ----
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(4); // Размер для верхней строки
-  display.setCursor(0,0);
-  //display.print("T:");
-  display.print(currentTemp, 2); // Две сотых
-  //display.print("C");
-
-  display.cp437(true); // Включаем режим CP437
-  // Теперь можно вывести, например, знак градуса
-  display.setTextSize(1);
-  display.setCursor(122, 0);
-  display.write(0xF8); // Код 0xF8 (248) — это символ "°"
+  
+  if (shouldRenderTemp) {
+    display.setTextSize(3); // Уменьшено с 4 до 3, чтобы освободить место снизу
+    display.setCursor(0, 0);
+    display.print(tempToDisplay, 2);
     
-  // ---- Нижняя строка: статус и счётчик (шрифт поменьше) ----
-  display.setTextSize(2);
+    // Значок градуса сдвигаем так, чтобы он не улетал
+    display.cp437(true);
+    display.setTextSize(1);
+    display.setCursor(92, 0); // Корректировка координаты X под размер шрифта 3
+    display.write(0xF8); 
+  }
+    
+  // ---- Нижняя строка: статус и счётчик (Строго на 25-м пикселе по вертикали) ----
+  display.setTextSize(1); // Уменьшено до 1, чтобы уместиться в оставшиеся 8 пикселей высоты
 
-  // Статус ШИМ: On или Off
-  display.setCursor(0, 50);
-  //display.write(isSolenoidOn ? 24 : 25);
+  // Статус ШИМ (клапан открыт/закрыт)
+  display.setCursor(0, 25);
   display.write(isSolenoidOn ? 45 : 25);
     
-    // Режим (AUTO / MANUAL)
-  display.print(isAutoMode ? "A" : "M");
+  // Режим (AUTO / MANUAL / SP)
+  display.print((isBlinkingStage || isShowingSpStage) ? " SP" : (isAutoMode ? " A " : " M "));
 
-  // Счётчик сработок
-  display.setCursor(28, 50);
-  display.print("Cnt");
-  display.setTextSize(3);
-  display.setCursor(68, 44);
+  // Счётчик сработок "Cnt:XXX" в одну компактную строчку
+  display.setCursor(45, 25); 
+  display.print("Cnt:");
   display.print(cycleCounter);
   
   display.display();
@@ -116,20 +149,54 @@ void updateDisplay() {
 void handleButtons() {
   bool b1 = digitalRead(BUTTON1_PIN);
   bool b2 = digitalRead(BUTTON2_PIN);
+  unsigned long now = millis();
   
-  // ---- Кнопка 1 (AUTO): открыть клапан и следить ----
-  if (b1 == LOW && lastButton1State == HIGH) {
-    delay(50); // Антидребезг
-    if (digitalRead(BUTTON1_PIN) == LOW) {
-      // Если клапан уже открыт, но режим AUTO не активен — всё равно открываем заново
-      if (!isAutoMode || isSolenoidOn) {
-        // Отключаем ШИМ, открываем клапан
-        turnSolenoidOff();
-        setpointTemp = currentTemp;       // Запоминаем температуру
-        isAutoMode = true;                // Включаем режим AUTO
-        cycleCounter = 0;                 // Сбрасываем счётчик (по желанию)
+  // ---- Кнопка 1 (AUTO / SP / RE-SETPOINT) ----
+  if (b1 == LOW) {
+    if (lastButton1State == HIGH) {
+      // Момент НАЖАТИЯ кнопки 1
+      delay(50); // Антидребезг
+      if (digitalRead(BUTTON1_PIN) == LOW) {
+        button1PressStartTime = now;
+        isButton1Depressed = true;
+        longPressExecuted = false;
       }
-      while(digitalRead(BUTTON1_PIN) == LOW); // Ждём отпускания
+    } else if (isButton1Depressed && !longPressExecuted) {
+      // Кнопка УДЕРЖИВАЕТСЯ
+      if (isAutoMode && (now - button1PressStartTime >= LONG_PRESS_TIME)) {
+        // --- ДОЛГОЕ НАЖАТИЕ В РЕЖИМЕ AUTO --- (Перезахват температуры)
+        turnSolenoidOff();              // Открываем клапан, если вдруг был закрыт
+        setpointTemp = currentTemp;     // Запоминаем новую ТЕКУЩУЮ температуру отбора
+        cycleCounter = 0;               // Сбрасываем счётчик сработок (как при первом входе)
+        autoModeStartTime = now;        // Запускаем долгое мигание (FLASH_DURATION)
+        showSpStartTime = 0;            // Гасим режим короткого просмотра
+        longPressExecuted = true;       // Помечаем, что долгое нажатие отработало
+      }
+    }
+  } else {
+    if (lastButton1State == LOW) {
+      // Момент ОТПУСКАНИЯ кнопки 1
+      delay(50); // Антидребезг
+      if (isButton1Depressed) {
+        isButton1Depressed = false;
+        
+        // Если долгое нажатие НЕ успело выполниться к моменту отпускания
+        if (!longPressExecuted) {
+          if (!isAutoMode) {
+            // --- ПЕРВОЕ НАЖАТИЕ: Вход в режим AUTO ---
+            turnSolenoidOff();
+            setpointTemp = currentTemp;
+            isAutoMode = true;
+            cycleCounter = 0;
+            autoModeStartTime = now;
+            showSpStartTime = 0;
+          } else {
+            // --- КОРОТКОЕ НАЖАТИЕ В РЕЖИМЕ AUTO --- (Просмотр уставки)
+            // Показываем текущую сохраненную уставку на короткое время
+            showSpStartTime = now;
+          }
+        }
+      }
     }
   }
   
@@ -137,13 +204,14 @@ void handleButtons() {
   if (b2 == LOW && lastButton2State == HIGH) {
     delay(50);
     if (digitalRead(BUTTON2_PIN) == LOW) {
-      // Переключаем состояние ШИМ (ручной режим)
       if (isSolenoidOn) {
         turnSolenoidOff();
       } else {
         turnSolenoidOn();
       }
-      isAutoMode = false; // Выход из AUTO при ручном переключении
+      isAutoMode = false; 
+      autoModeStartTime = 0;
+      showSpStartTime = 0;
       while(digitalRead(BUTTON2_PIN) == LOW);
     }
   }
@@ -156,75 +224,62 @@ void handleButtons() {
 void handleAutoMode() {
   if (!isAutoMode) return;
   
-  // Только если клапан открыт (ШИМ выключен) — следим за превышением
   if (!isSolenoidOn) {
     if (currentTemp >= (setpointTemp + TEMP_THRESHOLD)) {
-      // Превышение! Закрываем клапан
       turnSolenoidOn();
-      cycleCounter++; // Увеличиваем счётчик
+      cycleCounter++; 
     }
-  } 
-  // Если клапан закрыт (ШИМ включен) — проверяем гистерезис
-  else {
+  } else {
     if (currentTemp <= (setpointTemp + TEMP_HYSTERESIS)) {
-      // Температура вернулась в допуск — открываем клапан
       turnSolenoidOff();
-      // Счётчик НЕ сбрасываем — он накапливается за сессию
     }
   }
 }
 
 // ================= SETUP =================
 void setup() {
-  // --- Инициализация дисплея ---
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     for(;;);
   }
   
-  // --- Инициализация датчика ---
   sensors.begin();
-  sensors.setResolution(12); // Максимальное разрешение (0.0625°C)
+  sensors.setResolution(12);
+  sensors.setWaitForConversion(false); 
+  sensors.requestTemperatures();       
   
-  // --- Инициализация ШИМ ---
   setupHighFrequencyPWM();
   
-  // --- Настройка пинов ---
   pinMode(BUTTON1_PIN, INPUT_PULLUP);
   pinMode(BUTTON2_PIN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   
-  // --- Начальное состояние ---
-  turnSolenoidOn(); // При старте клапан закрыт (ШИМ включен)
+  turnSolenoidOn(); 
   isAutoMode = false;
   cycleCounter = 0;
   setpointTemp = 0.0;
   
-  // Первое обновление дисплея
   updateDisplay();
 }
 
 // ================= LOOP =================
 void loop() {
-  // ---- 1. Чтение температуры (не чаще 1 раза в 750 мс) ----
-  sensors.requestTemperatures();
-  currentTemp = sensors.getTempCByIndex(0);
+  unsigned long now = millis();
+
+  if (now - lastTempRequest >= 800) {
+    currentTemp = sensors.getTempCByIndex(0);
+    sensors.requestTemperatures(); 
+    lastTempRequest = now;
+  }
   
-  // ---- 2. Обработка кнопок (всегда) ----
   handleButtons();
   
-  // ---- 3. Логика автоматического режима (если активен) ----
-  unsigned long now = millis();
   if (now - lastTempCompare >= TEMP_COMPARE_INTERVAL) {
     handleAutoMode();
     lastTempCompare = now;
   }
   
-  // ---- 4. Обновление дисплея (с интервалом 500 мс) ----
   if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
     updateDisplay();
     lastDisplayUpdate = now;
   }
-  
-  // ---- Небольшая задержка для стабильности ----
-  delay(100);
 }
