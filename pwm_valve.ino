@@ -1,285 +1,425 @@
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_BMP085.h>
+#include <Adafruit_MAX31865.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-// ================= НАСТРОЙКИ =================
-// --- Дисплей ---
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 32
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-const int DISPLAY_UPDATE_INTERVAL = 200; // мс, для плавного мигания
+// ============================================================================
+// --- НАЗНАЧЕНИЕ ПИНОВ (Строго под ваше железо) ---
+// ============================================================================
+#define ONE_WIRE_BUS  2   // DS18B20 (Паразитное питание, D2)
+#define VALVE_PWM_PIN 3   // ШИМ Соленоида (Timer 2, D3)
+#define BUZZER_PIN    4   // Зуммер (D4)
+#define LED1_PIN      5   // LED 1: Залёт / Авария (Красный)
+#define LED2_PIN      6   // LED 2: Режим работы (Зеленый)
+#define LED3_PIN      7   // LED 3: Соленоид открыт (Синий)
 
-// --- Датчик температуры DS18B20 ---
-#define ONE_WIRE_BUS 2
+// Кнопки: A0, A1, A2, A3, D8
+const uint8_t BTN_PINS[5] = {A0, A1, A2, A3, 8};
+
+// MAX31865 (Аппаратный SPI: D10 CS, D11 MOSI, D12 MISO, D13 SCK)
+#define MAX_CS        10
+Adafruit_MAX31865 maxThermo = Adafruit_MAX31865(MAX_CS);
+#define RREF          4300.0
+#define RNOMINAL      1000.0
+
+// DS18B20
 OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
-const int TEMP_COMPARE_INTERVAL = 500; // мс, частота сравнения с установкой
-unsigned long lastTempRequest = 0;     // Время последнего запроса температуры
+DallasTemperature dsSensors(&oneWire);
+DeviceAddress dsCubeAddr;
+bool dsFound = false;
 
-// --- Кнопки ---
-const int BUTTON1_PIN = 3; // Кнопка 1: Автоматический режим / Перезахват / Показ SP
-const int BUTTON2_PIN = 4; // Кнопка 2: Ручной режим (триггер ШИМ)
+// I2C Дисплей и Барометр (A4 SDA, A5 SCL)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Adafruit_BMP085 bmp;
+bool bmpOK = false;
 
-// --- Светодиод ---
-const int LED_PIN = 12; // Внешний светодиод
+// ============================================================================
+// --- НАСТРОЙКИ РЕКТИФИКАЦИИ И СОЛЕНОИДА ---
+// ============================================================================
+const uint8_t PWM_MAX_VAL      = 255;  // 100% ШИМ при форсировании
+const unsigned long BOOST_MS   = 150;  // Длительность форс-импульса (мс)
+const uint8_t PWM_HOLD_VAL     = 40;   // Ток удержания (~35% мощности)
 
-// --- Настройки ШИМ для соленоида (25 кГц на пине 9) ---
-const int SOLENOID_PIN = 9;
-const int PULL_VALUE = 319; // 100% мощность
-const int HOLD_VALUE = 99;  // Мощность удержания (подбирать под соленоид)
-const int PULL_TIME = 300;  // Время полной мощности для втягивания (мс)
+const float TEMP_ZALET_LIMIT   = 0.10; // Порог залёта (°C)
+const float BARO_COEFF         = 0.037;// Поправка Tкип (°C на 1 мм рт. ст.)
+const float TEMP_CUBE_STOP     = 98.00;// Завершение отбора по кубу (°C)
+const float TEMP_BODY_ALARM    = 50.00;// Перегрев корпуса блока (°C)
 
-// --- Параметры управления ---
-// Учитывая шаг датчика 0,0625, реальное завышение, на которое среагирует автоматика, составит 0,125(так как 0,0625 еще меньше 0,1, а следующий шаг — уже 0,125). 
-const float TEMP_THRESHOLD = 0.125;  // Превышение для срабатывания (градусы)
-const float TEMP_HYSTERESIS = 0.0; // Гистерезис
+const unsigned long WAIT_STABILIZE_MS = 300000; // 5 минут отстоя (300 000 мс)
+const unsigned long PWM_PERIOD_MS     = 10000;  // Период ШИМ отбора (10 секунд)
 
-// --- Константы для мигания и отображения SP ---
-const unsigned long FLASH_DURATION = 3000;    // Время мигания при включении/перезахвате AUTO (мс)
-const unsigned long FLASH_INTERVAL = 500;     // Интервал мигания (полупериод, мс)
-const unsigned long SHOW_SP_DURATION = 1000;   // Сколько времени показывать SP при коротком нажатии (мс)
-const unsigned long SHOW_SP_INTERVAL = 200;    // Скорость мигания при коротком просмотре (мс)
-const unsigned long LONG_PRESS_TIME = 1500;   // Время удержания кнопки для долгого нажатия (мс)
+// ============================================================================
+// --- ПЕРЕМЕННЫЕ СОСТОЯНИЯ ---
+// ============================================================================
+enum WorkMode { MANUAL, AUTO, PWM_AUTO };
+WorkMode currentMode = MANUAL;
 
-// ================= ПЕРЕМЕННЫЕ СОСТОЯНИЯ =================
-float setpointTemp = 0.0;      // Запомненная температура при открытии клапана
-float currentTemp = 0.0;       // Текущая температура с датчика
-int cycleCounter = 0;          // Счётчик сработок по превышению
-bool isSolenoidOn = true;      // true = ШИМ включен (клапан закрыт)
-bool isAutoMode = false;       // true = режим автоматического слежения
-bool lastButton1State = HIGH;
-bool lastButton2State = HIGH;
+// Измерения
+float tempColumn = 0.00; 
+float cubeTemp   = -127.0; 
+float tempBody   = 0.00; 
+float pressmmHg  = 0.00; 
+
+// Базовые уставки
+float tempBase  = 0.00;
+float pressBase = 0.00;
+bool  isBaseSet = false;
+
+// Управление соленоидом
+bool          isSolenoidActive = false;
+bool          isBoosting       = false;
+unsigned long boostStartTime   = 0;
+
+uint8_t       pwmDutyPercent   = 80;    // Стартовая скважность (80%)
+unsigned long pwmCycleStartMs  = 0;
+
+// Флаги залёта и таймеры
+bool          isZaletActive    = false;
+bool          isStabilizing    = false;
+unsigned long stabilizeStartMs = 0;
+unsigned long lastZaletBeepMs  = 0;
+
+// Счётчик залётов
+uint16_t zaletCount = 0; // Счётчик залётов
+
+// Кнопки и Экран
+int           lastPressedButton = -1;
+uint8_t       currentPage       = 1;
+unsigned long pageSwitchMs      = 0;
 
 unsigned long lastDisplayUpdate = 0;
-unsigned long lastTempCompare = 0;
+unsigned long lastDSRequestTime = 0;
 
-// Таймеры для логики отображения и замера кнопок
-unsigned long autoModeStartTime = 0; // Время, когда включили режим AUTO (или перезахватили уставку)
-unsigned long showSpStartTime = 0;    // Время, когда запросили показ SP в режиме AUTO
-unsigned long button1PressStartTime = 0; // Время, когда кнопка 1 была зажата
-bool isButton1Depressed = false;     // Флаг того, что кнопка 1 удерживается
-bool longPressExecuted = false;      // Флаг, чтобы долгое нажатие не срабатывало циклически
-
-// ================= НАСТРОЙКА ШИМ (25 кГц) =================
-void setupHighFrequencyPWM() {
-  pinMode(SOLENOID_PIN, OUTPUT);
-  TCCR1A = 0;
-  TCCR1B = 0;
-  TCCR1A = (1 << WGM11) | (1 << COM1A1);
-  TCCR1B = (1 << WGM12) | (1 << WGM13) | (1 << CS10);
-  ICR1 = 319;
-  OCR1A = 0;
+// ============================================================================
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+// ============================================================================
+void beep(uint16_t freq = 2000, uint16_t duration = 40) {
+  tone(BUZZER_PIN, freq, duration);
 }
 
-// ================= УПРАВЛЕНИЕ СОЛЕНОИДОМ =================
-void turnSolenoidOn() {
-  OCR1A = PULL_VALUE;
-  delay(PULL_TIME);
-  OCR1A = HOLD_VALUE;
-  isSolenoidOn = true;
-  digitalWrite(LED_PIN, HIGH);
+void setupTimer2_Ultrasound() {
+  pinMode(VALVE_PWM_PIN, OUTPUT);
+  TCCR2B = (TCCR2B & 0xF8) | 0x01; // 31.25 kHz
+  analogWrite(VALVE_PWM_PIN, 0);
 }
 
-void turnSolenoidOff() {
-  OCR1A = 0;
-  isSolenoidOn = false;
-  digitalWrite(LED_PIN, LOW);
+float readPt1000() {
+  uint8_t fault = maxThermo.readFault();
+  if (fault) {
+    maxThermo.clearFault();
+  }
+  return maxThermo.temperature(RNOMINAL, RREF);
 }
 
-// ================= ОБНОВЛЕНИЕ ДИСПЛЕЯ (АДАПТИРОВАНО ПОД 128x32) =================
-void updateDisplay() {
-  display.clearDisplay();
-  unsigned long now = millis();
-  
-  bool isBlinkingStage = (isAutoMode && (now - autoModeStartTime < FLASH_DURATION));
-  bool isShowingSpStage = (isAutoMode && (now - showSpStartTime < SHOW_SP_DURATION));
-  
-  float tempToDisplay = currentTemp;
-  bool shouldRenderTemp = true;
+// Управление соленоидом (Форсирование -> Удержание)
+void setSolenoid(bool active) {
+  if (active && !isSolenoidActive) {
+    isSolenoidActive = true;
+    isBoosting       = true;
+    boostStartTime   = millis();
+    analogWrite(VALVE_PWM_PIN, PWM_MAX_VAL);
+    digitalWrite(LED3_PIN, HIGH);
+  } else if (!active && isSolenoidActive) {
+    isSolenoidActive = false;
+    isBoosting       = false;
+    analogWrite(VALVE_PWM_PIN, 0);
+    digitalWrite(LED3_PIN, LOW);
+  }
+}
 
-  if (isBlinkingStage) {
-    tempToDisplay = setpointTemp;
-    if ((now - autoModeStartTime) / FLASH_INTERVAL % 2 == 0) {
-      shouldRenderTemp = false; 
-    }
-  } else if (isShowingSpStage) {
-    tempToDisplay = setpointTemp;
-    if ((now - showSpStartTime) / SHOW_SP_INTERVAL % 2 == 0) {
-      shouldRenderTemp = false; 
+// ============================================================================
+// --- SETUP ---
+// ============================================================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  setupTimer2_Ultrasound();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED1_PIN, OUTPUT);
+  pinMode(LED2_PIN, OUTPUT);
+  pinMode(LED3_PIN, OUTPUT);
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(BTN_PINS[i], INPUT_PULLUP);
+  }
+
+  maxThermo.begin(MAX31865_2WIRE);
+
+  dsSensors.begin();
+  if (dsSensors.getDeviceCount() > 0) {
+    if (dsSensors.getAddress(dsCubeAddr, 0)) {
+      dsFound = true;
+      dsSensors.setResolution(dsCubeAddr, 11);
+      dsSensors.setWaitForConversion(false);
+      dsSensors.requestTemperatures();
+      lastDSRequestTime = millis();
     }
   }
 
-  // ---- Верхняя строка: температура (Размер 3 занимает 24 пикселя в высоту) ----
-  display.setTextColor(SSD1306_WHITE);
-  
-  if (shouldRenderTemp) {
-    display.setTextSize(3); // Уменьшено с 4 до 3, чтобы освободить место снизу
-    display.setCursor(0, 0);
-    display.print(tempToDisplay, 2);
-    
-    // Значок градуса сдвигаем так, чтобы он не улетал
-    display.cp437(true);
-    display.setTextSize(1);
-    display.setCursor(92, 0); // Корректировка координаты X под размер шрифта 3
-    display.write(0xF8); 
-  }
-    
-  // ---- Нижняя строка: статус и счётчик (Строго на 25-м пикселе по вертикали) ----
-  display.setTextSize(1); // Уменьшено до 1, чтобы уместиться в оставшиеся 8 пикселей высоты
+  lcd.init();
+  lcd.backlight();
+  bmpOK = bmp.begin();
 
-  // Статус ШИМ (клапан открыт/закрыт)
-  display.setCursor(0, 25);
-  display.write(isSolenoidOn ? 45 : 25);
-    
-  // Режим (AUTO / MANUAL / SP)
-  display.print((isBlinkingStage || isShowingSpStage) ? " SP" : (isAutoMode ? " A " : " M "));
+  lcd.setCursor(0, 0);
+  lcd.print(bmpOK ? "BMP: OK" : "BMP: ERR");
+  lcd.setCursor(9, 0);
+  lcd.print(dsFound ? "DS: OK" : "DS: ERR");
 
-  // Счётчик сработок "Cnt:XXX" в одну компактную строчку
-  display.setCursor(45, 25); 
-  display.print("Cnt:");
-  display.print(cycleCounter);
-  
-  display.display();
+  beep(1000, 100);
+  delay(1200);
+  lcd.clear();
 }
 
-// ================= ОБРАБОТКА КНОПОК =================
-void handleButtons() {
-  bool b1 = digitalRead(BUTTON1_PIN);
-  bool b2 = digitalRead(BUTTON2_PIN);
-  unsigned long now = millis();
-  
-  // ---- Кнопка 1 (AUTO / SP / RE-SETPOINT) ----
-  if (b1 == LOW) {
-    if (lastButton1State == HIGH) {
-      // Момент НАЖАТИЯ кнопки 1
-      delay(50); // Антидребезг
-      if (digitalRead(BUTTON1_PIN) == LOW) {
-        button1PressStartTime = now;
-        isButton1Depressed = true;
-        longPressExecuted = false;
-      }
-    } else if (isButton1Depressed && !longPressExecuted) {
-      // Кнопка УДЕРЖИВАЕТСЯ
-      if (isAutoMode && (now - button1PressStartTime >= LONG_PRESS_TIME)) {
-        // --- ДОЛГОЕ НАЖАТИЕ В РЕЖИМЕ AUTO --- (Перезахват температуры)
-        turnSolenoidOff();              // Открываем клапан, если вдруг был закрыт
-        setpointTemp = currentTemp;     // Запоминаем новую ТЕКУЩУЮ температуру отбора
-        cycleCounter = 0;               // Сбрасываем счётчик сработок (как при первом входе)
-        autoModeStartTime = now;        // Запускаем долгое мигание (FLASH_DURATION)
-        showSpStartTime = 0;            // Гасим режим короткого просмотра
-        longPressExecuted = true;       // Помечаем, что долгое нажатие отработало
-      }
+// ============================================================================
+// --- MAIN LOOP ---
+// ============================================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // 1. АВТОПЕРЕХОД ИЗ ФОРСИРОВАНИЯ В УДЕРЖАНИЕ СОЛЕНОИДА
+  if (isSolenoidActive && isBoosting) {
+    if (currentMillis - boostStartTime >= BOOST_MS) {
+      isBoosting = false;
+      analogWrite(VALVE_PWM_PIN, PWM_HOLD_VAL);
     }
-  } else {
-    if (lastButton1State == LOW) {
-      // Момент ОТПУСКАНИЯ кнопки 1
-      delay(50); // Антидребезг
-      if (isButton1Depressed) {
-        isButton1Depressed = false;
-        
-        // Если долгое нажатие НЕ успело выполниться к моменту отпускания
-        if (!longPressExecuted) {
-          if (!isAutoMode) {
-            // --- ПЕРВОЕ НАЖАТИЕ: Вход в режим AUTO ---
-            turnSolenoidOff();
-            setpointTemp = currentTemp;
-            isAutoMode = true;
-            cycleCounter = 0;
-            autoModeStartTime = now;
-            showSpStartTime = 0;
-          } else {
-            // --- КОРОТКОЕ НАЖАТИЕ В РЕЖИМЕ AUTO --- (Просмотр уставки)
-            // Показываем текущую сохраненную уставку на короткое время
-            showSpStartTime = now;
+  }
+
+  // 2. ЧТЕНИЕ ДАТЧИКОВ
+  tempColumn = readPt1000();
+
+  if (bmpOK) {
+    pressmmHg = bmp.readPressure() * 0.00750062;
+    tempBody  = bmp.readTemperature();
+  }
+
+  if (dsFound && (currentMillis - lastDSRequestTime >= 500)) {
+    cubeTemp = dsSensors.getTempC(dsCubeAddr);
+    dsSensors.requestTemperatures();
+    lastDSRequestTime = currentMillis;
+  }
+
+  // 3. ОБРАБОТКА КНОПОК
+  int currentPressed = -1;
+  for (int i = 0; i < 5; i++) {
+    if (digitalRead(BTN_PINS[i]) == LOW) {
+      currentPressed = i + 1;
+      break;
+    }
+  }
+
+if (currentPressed != -1 && currentPressed != lastPressedButton) {
+    beep(2400, 30);
+
+    switch (currentPressed) {
+      case 1: // Кнопка 1 (A0): Открытие/Закрытие клапана в ручном режиме
+        if (currentMode == MANUAL) {
+          setSolenoid(!isSolenoidActive);
+        }
+        break;
+
+      case 2: // Кнопка 2 (A1): Переключение режима
+        if (currentMode == MANUAL) currentMode = AUTO;
+        else if (currentMode == AUTO) currentMode = PWM_AUTO;
+        else currentMode = MANUAL;
+
+        isZaletActive = false;
+        isStabilizing = false;
+        setSolenoid(false);
+        break;
+
+      case 3: // Кнопка 3 (A2): Фиксация T_base и P_base / Сброс аварии и залётов
+        tempBase   = tempColumn;
+        pressBase  = pressmmHg;
+        isBaseSet  = true;
+        isZaletActive = false;
+        isStabilizing = false;
+        zaletCount = 0; // <-- Сбрасываем счётчик при установке базы
+        digitalWrite(LED1_PIN, LOW);
+        break;
+
+      case 4: // Кнопка 4 (A3): Корректировка скважности ШИМ
+        if (pwmDutyPercent > 10) pwmDutyPercent -= 10;
+        else pwmDutyPercent = 80;
+        break;
+
+      case 5: // Кнопка 5 (D8): Переключение страниц дисплея
+        currentPage++;
+        if (currentPage > 3) currentPage = 1;
+        pageSwitchMs = currentMillis;
+        lcd.clear(); // Очищаем экран ТОЛЬКО один раз при смене страницы
+        break;
+    }
+    lastPressedButton = currentPressed;
+  } else if (currentPressed == -1) {
+    lastPressedButton = -1;
+  }
+
+  // 4. ЗАЩИТА: ПЕРЕГРЕВ КОРПУСА И ОКОНЧАНИЕ ОТБОРА ПО КУБУ
+  if (bmpOK && tempBody >= TEMP_BODY_ALARM) {
+    setSolenoid(false);
+    digitalWrite(LED1_PIN, HIGH);
+    beep(3500, 100);
+  }
+
+  if (dsFound && cubeTemp >= TEMP_CUBE_STOP && currentMode != MANUAL) {
+    setSolenoid(false);
+    currentMode = MANUAL;
+    // Тройная финишная трель
+    for (int i = 0; i < 3; i++) { beep(3000, 200); delay(100); }
+  }
+
+  // 5. ЛОГИКА АВТОМАТИКИ (AUTO И PWM_AUTO)
+  if ((currentMode == AUTO || currentMode == PWM_AUTO) && isBaseSet) {
+    digitalWrite(LED2_PIN, HIGH); // Зеленый LED
+    float currentTTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF;
+
+    // Проверка залёта
+    if (tempColumn >= (currentTTarget + TEMP_ZALET_LIMIT)) {
+      if (!isZaletActive) {
+        isZaletActive = true;
+        isStabilizing = false;
+        zaletCount++; // <-- Увеличиваем счётчик залётов
+        digitalWrite(LED1_PIN, HIGH); // Красный LED
+        beep(2400, 100);
+        setSolenoid(false);
+
+        if (currentMode == PWM_AUTO) {
+          if (pwmDutyPercent > 10) pwmDutyPercent -= 10;
+          else {
+            currentMode = MANUAL; // Скважность упала до нуля — финиш
           }
         }
       }
-    }
-  }
-  
-  // ---- Кнопка 2 (MANUAL): триггер ШИМ вкл/выкл ----
-  if (b2 == LOW && lastButton2State == HIGH) {
-    delay(50);
-    if (digitalRead(BUTTON2_PIN) == LOW) {
-      if (isSolenoidOn) {
-        turnSolenoidOff();
-      } else {
-        turnSolenoidOn();
+    } else {
+      if (isZaletActive && !isStabilizing) {
+        isStabilizing = true;
+        stabilizeStartMs = currentMillis;
       }
-      isAutoMode = false; 
-      autoModeStartTime = 0;
-      showSpStartTime = 0;
-      while(digitalRead(BUTTON2_PIN) == LOW);
     }
-  }
-  
-  lastButton1State = b1;
-  lastButton2State = b2;
-}
 
-// ================= ЛОГИКА АВТОМАТИЧЕСКОГО РЕЖИМА =================
-void handleAutoMode() {
-  if (!isAutoMode) return;
-  
-  if (!isSolenoidOn) {
-    if (currentTemp >= (setpointTemp + TEMP_THRESHOLD)) {
-      turnSolenoidOn();
-      cycleCounter++; 
+    // Выдержка 5 минут отстоя
+    if (isStabilizing) {
+      if (currentMillis - lastZaletBeepMs >= 60000) { // Пик раз в минуту
+        beep(2000, 30);
+        lastZaletBeepMs = currentMillis;
+      }
+
+      if (currentMillis - stabilizeStartMs >= WAIT_STABILIZE_MS) {
+        isZaletActive = false;
+        isStabilizing = false;
+        digitalWrite(LED1_PIN, LOW);
+      }
+    }
+
+    // Исполнение отбора
+    if (!isZaletActive && !isStabilizing) {
+      if (currentMode == AUTO) {
+        setSolenoid(true);
+      } else if (currentMode == PWM_AUTO) {
+        unsigned long currentPwmMs = currentMillis - pwmCycleStartMs;
+        if (currentPwmMs >= PWM_PERIOD_MS) {
+          pwmCycleStartMs = currentMillis;
+          currentPwmMs = 0;
+        }
+
+        unsigned long openTimeMs = (PWM_PERIOD_MS * pwmDutyPercent) / 100;
+        setSolenoid(currentPwmMs < openTimeMs);
+      }
     }
   } else {
-    if (currentTemp <= (setpointTemp + TEMP_HYSTERESIS)) {
-      turnSolenoidOff();
+    digitalWrite(LED2_PIN, LOW);
+  }
+
+// 6. ОБНОВЛЕНИЕ ДИСПЛЕЯ (Раз в 300 мс)
+  if (currentMillis - lastDisplayUpdate >= 300) {
+    lastDisplayUpdate = currentMillis;
+
+    // Автовозврат на Стр 1 через 5 секунд
+    if (currentPage != 1 && (currentMillis - pageSwitchMs >= 5000)) {
+      currentPage = 1;
+      lcd.clear(); // Очищаем экран при автовозврате
     }
-  }
-}
 
-// ================= SETUP =================
-void setup() {
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    for(;;);
-  }
-  
-  sensors.begin();
-  sensors.setResolution(12);
-  sensors.setWaitForConversion(false); 
-  sensors.requestTemperatures();       
-  
-  setupHighFrequencyPWM();
-  
-  pinMode(BUTTON1_PIN, INPUT_PULLUP);
-  pinMode(BUTTON2_PIN, INPUT_PULLUP);
-  pinMode(LED_PIN, OUTPUT);
-  
-  turnSolenoidOn(); 
-  isAutoMode = false;
-  cycleCounter = 0;
-  setpointTemp = 0.0;
-  
-  updateDisplay();
-}
+    // ВНИМАНИЕ: lcd.clear() отсюда убран!
 
-// ================= LOOP =================
-void loop() {
-  unsigned long now = millis();
+    switch (currentPage) {
+      case 1: // Главный рабочий экран (Строка 1: "Pt:78.4  C:82.1 ")
+        lcd.setCursor(0, 0);
+        lcd.print("Pt:"); 
+        if (tempColumn > -50 && tempColumn < 200) {
+          lcd.print(tempColumn, 1);
+          if (tempColumn < 100.0) lcd.print(" "); // Пробел для стирания лишнего знака
+        } else {
+          lcd.print("ERR ");
+        }
 
-  if (now - lastTempRequest >= 800) {
-    currentTemp = sensors.getTempCByIndex(0);
-    sensors.requestTemperatures(); 
-    lastTempRequest = now;
-  }
-  
-  handleButtons();
-  
-  if (now - lastTempCompare >= TEMP_COMPARE_INTERVAL) {
-    handleAutoMode();
-    lastTempCompare = now;
-  }
-  
-  if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
-    updateDisplay();
-    lastDisplayUpdate = now;
+        lcd.setCursor(8, 0);
+        lcd.print(" C:");
+        if (dsFound && cubeTemp > -50 && cubeTemp < 125) {
+          lcd.print(cubeTemp, 1);
+          lcd.print(" ");
+        } else {
+          lcd.print("ERR ");
+        }
+
+        // Строка 2: "MAN     V:OFF  "
+        lcd.setCursor(0, 1);
+        if (currentMode == MANUAL)        lcd.print("MAN   ");
+        else if (currentMode == AUTO)    lcd.print("AUTO  ");
+        else {
+          lcd.print("P"); 
+          lcd.print(pwmDutyPercent); 
+          if (pwmDutyPercent < 100) lcd.print("% ");
+          else lcd.print("%");
+        }
+
+        lcd.setCursor(8, 1);
+        if (isBoosting)            lcd.print(" V:BOOST");
+        else if (isSolenoidActive) lcd.print(" V:HOLD ");
+        else                       lcd.print(" V:OFF  ");
+        break;
+
+      case 2: // Экран уставок и залётов
+        // --- Строка 1: Tbase и Счётчик залётов ---
+        lcd.setCursor(0, 0);
+        lcd.print("Tb:");
+        if (isBaseSet) {
+          lcd.print(tempBase, 2);
+        } else {
+          lcd.print("NONE ");
+        }
+
+        lcd.setCursor(9, 0);
+        lcd.print("Z:");
+        lcd.print(zaletCount);
+        lcd.print("   "); // Пробелы для затирания лишних цифр при сбросе
+
+        // --- Строка 2: Pbase ---
+        lcd.setCursor(0, 1);
+        lcd.print("Pb:");
+        if (isBaseSet) {
+          lcd.print(pressBase, 1);
+          lcd.print(" ");
+        } else {
+          lcd.print("NONE ");
+        }
+        break;
+
+      case 3: // Экран диагностики
+        lcd.setCursor(0, 0);
+        lcd.print("Pcurr:"); 
+        lcd.print(pressmmHg, 1); 
+        lcd.print(" mmHg  ");
+
+        lcd.setCursor(0, 1);
+        lcd.print("Tin:"); 
+        lcd.print(tempBody, 1); 
+        lcd.print(" C    ");
+        break;
+    }
   }
 }
