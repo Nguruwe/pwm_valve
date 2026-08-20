@@ -33,9 +33,8 @@ const int HOLD_VALUE = 99;  // Мощность удержания (подбир
 const int PULL_TIME = 300;  // Время полной мощности для втягивания (мс)
 
 // --- Параметры управления ---
-// Учитывая шаг датчика 0,0625, реальное завышение, на которое среагирует автоматика, составит 0,125(так как 0,0625 еще меньше 0,1, а следующий шаг — уже 0,125). 
-const float TEMP_THRESHOLD = 0.125;  // Превышение для срабатывания (градусы)
-const float TEMP_HYSTERESIS = 0.0; // Гистерезис
+const float TEMP_THRESHOLD = 0.125; // Превышение для срабатывания (градусы)
+const float TEMP_HYSTERESIS = 0.0;  // Гистерезис
 
 // --- Константы для мигания и отображения SP ---
 const unsigned long FLASH_DURATION = 3000;    // Время мигания при включении/перезахвате AUTO (мс)
@@ -48,7 +47,7 @@ const unsigned long LONG_PRESS_TIME = 1500;   // Время удержания �
 float setpointTemp = 0.0;      // Запомненная температура при открытии клапана
 float currentTemp = 0.0;       // Текущая температура с датчика
 int cycleCounter = 0;          // Счётчик сработок по превышению
-bool isSolenoidOn = true;      // true = ШИМ включен (клапан закрыт)
+bool isSolenoidOn = false;     // true = ШИМ включен (НЗ клапан ОТКРЫТ)
 bool isAutoMode = false;       // true = режим автоматического слежения
 bool lastButton1State = HIGH;
 bool lastButton2State = HIGH;
@@ -57,11 +56,11 @@ unsigned long lastDisplayUpdate = 0;
 unsigned long lastTempCompare = 0;
 
 // Таймеры для логики отображения и замера кнопок
-unsigned long autoModeStartTime = 0; // Время, когда включили режим AUTO (или перезахватили уставку)
-unsigned long showSpStartTime = 0;    // Время, когда запросили показ SP в режиме AUTO
+unsigned long autoModeStartTime = 0;     // Время, когда включили режим AUTO (или перезахватили уставку)
+unsigned long showSpStartTime = 0;        // Время, когда запросили показ SP в режиме AUTO
 unsigned long button1PressStartTime = 0; // Время, когда кнопка 1 была зажата
-bool isButton1Depressed = false;     // Флаг того, что кнопка 1 удерживается
-bool longPressExecuted = false;      // Флаг, чтобы долгое нажатие не срабатывало циклически
+bool isButton1Depressed = false;         // Флаг того, что кнопка 1 удерживается
+bool longPressExecuted = false;          // Флаг, чтобы долгое нажатие не срабатывало циклически
 
 // ================= НАСТРОЙКА ШИМ (25 кГц) =================
 void setupHighFrequencyPWM() {
@@ -74,8 +73,9 @@ void setupHighFrequencyPWM() {
   OCR1A = 0;
 }
 
-// ================= УПРАВЛЕНИЕ СОЛЕНОИДОМ =================
+// ================= УПРАВЛЕНИЕ СОЛЕНОИДОМ (НЗ КЛАПАН) =================
 void turnSolenoidOn() {
+  // Включаем ШИМ -> Нормально Закрытый клапан ОТКРЫВАЕТСЯ
   OCR1A = PULL_VALUE;
   delay(PULL_TIME);
   OCR1A = HOLD_VALUE;
@@ -84,12 +84,13 @@ void turnSolenoidOn() {
 }
 
 void turnSolenoidOff() {
+  // Обесточиваем -> Нормально Закрытый клапан ЗАКРЫВАЕТСЯ
   OCR1A = 0;
   isSolenoidOn = false;
   digitalWrite(LED_PIN, LOW);
 }
 
-// ================= ОБНОВЛЕНИЕ ДИСПЛЕЯ (АДАПТИРОВАНО ПОД 128x32) =================
+// ================= ОБНОВЛЕНИЕ ДИСПЛЕЯ (128x32) =================
 void updateDisplay() {
   display.clearDisplay();
   unsigned long now = millis();
@@ -112,32 +113,31 @@ void updateDisplay() {
     }
   }
 
-  // ---- Верхняя строка: температура (Размер 3 занимает 24 пикселя в высоту) ----
+  // ---- Верхняя строка: температура ----
   display.setTextColor(SSD1306_WHITE);
   
   if (shouldRenderTemp) {
-    display.setTextSize(3); // Уменьшено с 4 до 3, чтобы освободить место снизу
+    display.setTextSize(3);
     display.setCursor(0, 0);
     display.print(tempToDisplay, 2);
     
-    // Значок градуса сдвигаем так, чтобы он не улетал
     display.cp437(true);
     display.setTextSize(1);
-    display.setCursor(92, 0); // Корректировка координаты X под размер шрифта 3
-    display.write(0xF8); 
+    display.setCursor(92, 0);
+    display.write(0xF8); // Значок градуса
   }
     
-  // ---- Нижняя строка: статус и счётчик (Строго на 25-м пикселе по вертикали) ----
-  display.setTextSize(1); // Уменьшено до 1, чтобы уместиться в оставшиеся 8 пикселей высоты
+  // ---- Нижняя строка: статус и счётчик ----
+  display.setTextSize(1);
 
-  // Статус ШИМ (клапан открыт/закрыт)
+  // Статус клапана: для НЗ клапана isSolenoidOn == true означает, что он ОТКРЫТ
   display.setCursor(0, 25);
-  display.write(isSolenoidOn ? 45 : 25);
+  display.write(isSolenoidOn ? 25 : 45); // Символ 25 (стрелка/открыто) или 45 (минус/закрыто)
     
   // Режим (AUTO / MANUAL / SP)
   display.print((isBlinkingStage || isShowingSpStage) ? " SP" : (isAutoMode ? " A " : " M "));
 
-  // Счётчик сработок "Cnt:XXX" в одну компактную строчку
+  // Счётчик сработок
   display.setCursor(45, 25); 
   display.print("Cnt:");
   display.print(cycleCounter);
@@ -165,12 +165,12 @@ void handleButtons() {
       // Кнопка УДЕРЖИВАЕТСЯ
       if (isAutoMode && (now - button1PressStartTime >= LONG_PRESS_TIME)) {
         // --- ДОЛГОЕ НАЖАТИЕ В РЕЖИМЕ AUTO --- (Перезахват температуры)
-        turnSolenoidOff();              // Открываем клапан, если вдруг был закрыт
-        setpointTemp = currentTemp;     // Запоминаем новую ТЕКУЩУЮ температуру отбора
-        cycleCounter = 0;               // Сбрасываем счётчик сработок (как при первом входе)
-        autoModeStartTime = now;        // Запускаем долгое мигание (FLASH_DURATION)
-        showSpStartTime = 0;            // Гасим режим короткого просмотра
-        longPressExecuted = true;       // Помечаем, что долгое нажатие отработало
+        turnSolenoidOn();               // Для НЗ клапана: подаем питание, ОТКРЫВАЕМ отбор
+        setpointTemp = currentTemp;     // Запоминаем новую ТЕКУЩУЮ температуру
+        cycleCounter = 0;               // Сбрасываем счётчик
+        autoModeStartTime = now;        // Запускаем мигание
+        showSpStartTime = 0;
+        longPressExecuted = true;
       }
     }
   } else {
@@ -180,11 +180,10 @@ void handleButtons() {
       if (isButton1Depressed) {
         isButton1Depressed = false;
         
-        // Если долгое нажатие НЕ успело выполниться к моменту отпускания
         if (!longPressExecuted) {
           if (!isAutoMode) {
             // --- ПЕРВОЕ НАЖАТИЕ: Вход в режим AUTO ---
-            turnSolenoidOff();
+            turnSolenoidOn();           // Для НЗ клапана: ОТКРЫВАЕМ отбор
             setpointTemp = currentTemp;
             isAutoMode = true;
             cycleCounter = 0;
@@ -192,7 +191,6 @@ void handleButtons() {
             showSpStartTime = 0;
           } else {
             // --- КОРОТКОЕ НАЖАТИЕ В РЕЖИМЕ AUTO --- (Просмотр уставки)
-            // Показываем текущую сохраненную уставку на короткое время
             showSpStartTime = now;
           }
         }
@@ -220,18 +218,22 @@ void handleButtons() {
   lastButton2State = b2;
 }
 
-// ================= ЛОГИКА АВТОМАТИЧЕСКОГО РЕЖИМА =================
+// ================= ЛОГИКА АВТОМАТИЧЕСКОГО РЕЖИМА (НЗ КЛАПАН) =================
 void handleAutoMode() {
   if (!isAutoMode) return;
   
-  if (!isSolenoidOn) {
+  // Если отбор открыт (ШИМ подается)
+  if (isSolenoidOn) {
+    // Температура поднялась выше порога -> Перекрываем отбор (обесточиваем НЗ клапан)
     if (currentTemp >= (setpointTemp + TEMP_THRESHOLD)) {
-      turnSolenoidOn();
+      turnSolenoidOff();
       cycleCounter++; 
     }
   } else {
+    // Если отбор перекрыт, ждем остывания
+    // Температура вернулась к норме -> Возобновляем отбор (подаем ШИМ на НЗ клапан)
     if (currentTemp <= (setpointTemp + TEMP_HYSTERESIS)) {
-      turnSolenoidOff();
+      turnSolenoidOn();
     }
   }
 }
@@ -253,7 +255,8 @@ void setup() {
   pinMode(BUTTON2_PIN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   
-  turnSolenoidOn(); 
+  // При старте система в безопасном состоянии (клапан обесточен / закрыт)
+  turnSolenoidOff(); 
   isAutoMode = false;
   cycleCounter = 0;
   setpointTemp = 0.0;
