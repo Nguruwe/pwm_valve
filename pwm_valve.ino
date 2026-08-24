@@ -18,6 +18,10 @@
 // Кнопки: A0, A1, A2, A3, D8
 const uint8_t BTN_PINS[5] = {A0, A1, A2, A3, 8};
 
+// --- ФИЛЬТРАЦИЯ И ОПРОС PT1000 ---
+unsigned long lastPtReadMs = 0;
+const unsigned long PT_READ_INTERVAL_MS = 200; // Опрашиваем Pt1000 раз в 200 мс (5 раз в секунду)
+
 // MAX31865 (Аппаратный SPI: D10 CS, D11 MOSI, D12 MISO, D13 SCK)
 #define MAX_CS        10
 Adafruit_MAX31865 maxThermo = Adafruit_MAX31865(MAX_CS);
@@ -107,10 +111,23 @@ void setupTimer2_Ultrasound() {
 
 float readPt1000() {
   uint8_t fault = maxThermo.readFault();
+  
   if (fault) {
     maxThermo.clearFault();
+    
+    // Если произошел сбой из-за наводки, перезанициализируем модуль по SPI
+    maxThermo.begin(MAX31865_2WIRE); 
+    return -999.0; // Сигнал ошибки для фильтра
   }
-  return maxThermo.temperature(RNOMINAL, RREF);
+
+  float rawTemp = maxThermo.temperature(RNOMINAL, RREF);
+
+  // Фильтрация заведомо нереальных бросков от наводок (например, > 150°C или < -20°C)
+  if (rawTemp < -20.0 || rawTemp > 150.0) {
+    return -999.0; 
+  }
+
+  return rawTemp;
 }
 
 // Управление соленоидом (Форсирование -> Удержание)
@@ -188,8 +205,23 @@ void loop() {
     }
   }
 
-  // 2. ЧТЕНИЕ ДАТЧИКОВ
-  tempColumn = readPt1000();
+// 2. ЧТЕНИЕ ДАТЧИКОВ
+  
+  // Опрос Pt1000 ровно раз в 200 мс
+  if (currentMillis - lastPtReadMs >= PT_READ_INTERVAL_MS) {
+    lastPtReadMs = currentMillis;
+    
+    float freshTemp = readPt1000();
+    if (freshTemp != -999.0) {
+      if (tempColumn == 0.0) {
+        tempColumn = freshTemp; // Первичная инициализация при старте
+      } else {
+        // Коэффициент 0.10 при опросе 5 раз в сек дает сглаживание примерно на 2 секунды.
+        // Чем меньше число (например, 0.05), тем сильнее и плавнее фильтр.
+        tempColumn = (tempColumn * 0.90) + (freshTemp * 0.10);
+      }
+    }
+  }
 
   if (bmpOK) {
     pressmmHg = bmp.readPressure() * 0.00750062;
@@ -351,7 +383,7 @@ if (currentPressed != -1 && currentPressed != lastPressedButton) {
         lcd.setCursor(0, 0);
         lcd.print("Pt:"); 
         if (tempColumn > -50 && tempColumn < 200) {
-          lcd.print(tempColumn, 1);
+          lcd.print(tempColumn, 2);
           if (tempColumn < 100.0) lcd.print(" "); // Пробел для стирания лишнего знака
         } else {
           lcd.print("ERR ");
