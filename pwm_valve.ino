@@ -148,13 +148,21 @@ bool isAutoRepeat = false;
 // --- ЗВУКОВЫЕ СИГНАЛЫ ---
 // ============================================================================
 void beep(uint16_t freq = 2000, uint16_t duration = 40) {
-  tone(BUZZER_PIN, freq, duration);
+  // Безтаймерный писк, не трогающий Timer 2!
+  long periodUs = 1000000L / freq;
+  long cycles = ((long)freq * duration) / 1000L;
+  for (long i = 0; i < cycles; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delayMicroseconds(periodUs / 2);
+    digitalWrite(BUZZER_PIN, LOW);
+    delayMicroseconds(periodUs / 2);
+  }
 }
 
 void soundClick()   { beep(2400, 20); }
 void soundConfirm() { beep(2800, 50); delay(60); beep(3200, 70); }
 void soundCancel()  { beep(1200, 150); }
-void soundEmergency(){ tone(BUZZER_PIN, 1000, 400); }
+void soundEmergency() { beep(1000, 400); }
 
 // ============================================================================
 // --- УПРАВЛЕНИЕ АППАРАТУРОЙ ---
@@ -261,7 +269,10 @@ void applyDraftValue() {
         isZaletActive = false;
         isStabilizing = false;
         setSolenoid(false);
-        if (currentMode == PWM_AUTO) pwmDutyPercent = settings.pwmStartDuty;
+        if (currentMode == PWM_AUTO) {
+          pwmDutyPercent = settings.pwmStartDuty;
+          pwmCycleStartMs = millis(); // <--- СБРОС ТАЙМЕРА ЦИКЛА ШИМ
+        }
       }
       break;
     case 3:
@@ -361,22 +372,12 @@ void setup() {
 
   maxThermo.begin(MAX31865_2WIRE);
 
-  dsSensors.begin();
-  if (dsSensors.getDeviceCount() > 0) {
-    if (dsSensors.getAddress(dsCubeAddr, 0)) {
-      dsFound = true;
-      dsSensors.setResolution(dsCubeAddr, 11);
-      dsSensors.setWaitForConversion(false);
-      dsSensors.requestTemperatures();
-    }
-  }
-
   lcd.init();
   lcd.backlight();
   bmpOK = bmp.begin();
 
   lcd.setCursor(0, 0); lcd.print(bmpOK ? "BMP: OK " : "BMP: ERR");
-  lcd.setCursor(9, 0); lcd.print(dsFound ? "DS: OK" : "DS: ERR");
+  lcd.setCursor(9, 0); lcd.print("DS: WAIT");
 
   soundConfirm();
   delay(1000);
@@ -624,6 +625,7 @@ void loop() {
       if (currentMillis - stabilizeStartMs >= (settings.stabilizeTimeMin * 60000UL)) {
         isZaletActive = false;
         isStabilizing = false;
+        pwmCycleStartMs = currentMillis; // В момент завершения отстоя (в месте, где сбрасываются флаги залёта), нужно сбрасывать стартовое время ШИМ-цикла
         digitalWrite(LED1_PIN, LOW);
       }
     }
