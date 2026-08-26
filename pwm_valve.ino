@@ -4,9 +4,10 @@
 #include <Adafruit_MAX31865.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <EEPROM.h>
 
 // ============================================================================
-// --- НАЗНАЧЕНИЕ ПИНОВ (Строго под ваше железо) ---
+// --- НАЗНАЧЕНИЕ ПИНОВ ---
 // ============================================================================
 #define ONE_WIRE_BUS  2   // DS18B20 (Паразитное питание, D2)
 #define VALVE_PWM_PIN 3   // ШИМ Соленоида (Timer 2, D3)
@@ -15,14 +16,11 @@
 #define LED2_PIN      6   // LED 2: Режим работы (Зеленый)
 #define LED3_PIN      7   // LED 3: Соленоид открыт (Синий)
 
-// Кнопки: A0, A1, A2, A3, D8
+// Кнопки: A0 (Вправо), A1 (Вверх), A2 (Select), A3 (Вниз), D8 (Влево)
 const uint8_t BTN_PINS[5] = {A0, A1, A2, A3, 8};
+enum BtnIndex { BTN_RIGHT = 0, BTN_UP = 1, BTN_SELECT = 2, BTN_DOWN = 3, BTN_LEFT = 4 };
 
-// --- ФИЛЬТРАЦИЯ И ОПРОС PT1000 ---
-unsigned long lastPtReadMs = 0;
-const unsigned long PT_READ_INTERVAL_MS = 200; // Опрашиваем Pt1000 раз в 200 мс (5 раз в секунду)
-
-// MAX31865 (Аппаратный SPI: D10 CS, D11 MOSI, D12 MISO, D13 SCK)
+// MAX31865 (SPI: D10 CS, D11 MOSI, D12 MISO, D13 SCK)
 #define MAX_CS        10
 Adafruit_MAX31865 maxThermo = Adafruit_MAX31865(MAX_CS);
 #define RREF          4300.0
@@ -34,103 +32,151 @@ DallasTemperature dsSensors(&oneWire);
 DeviceAddress dsCubeAddr;
 bool dsFound = false;
 
-// I2C Дисплей и Барометр (A4 SDA, A5 SCL)
+// I2C Дисплей и Барометр
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Adafruit_BMP085 bmp;
 bool bmpOK = false;
 
 // ============================================================================
-// --- НАСТРОЙКИ РЕКТИФИКАЦИИ И СОЛЕНОИДА ---
+// --- СТРУКТУРА EEPROM И НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
 // ============================================================================
-const uint8_t PWM_MAX_VAL      = 255;  // 100% ШИМ при форсировании
-const unsigned long BOOST_MS   = 150;  // Длительность форс-импульса (мс)
-const uint8_t PWM_HOLD_VAL     = 40;   // Ток удержания (~35% мощности)
+#define EEPROM_MAGIC 0x4156 // Сигнатура целостности данных EEPROM
 
-const float TEMP_ZALET_LIMIT   = 0.10; // Порог залёта (°C)
-const float BARO_COEFF         = 0.037;// Поправка Tкип (°C на 1 мм рт. ст.)
-const float TEMP_CUBE_STOP     = 98.00;// Завершение отбора по кубу (°C)
-const float TEMP_BODY_ALARM    = 50.00;// Перегрев корпуса блока (°C)
+struct EEPROM_Settings {
+  uint16_t magic;
+  uint8_t  emaAlphaPercent;   // Фильтр Pt1000 (1..50%, default 10%)
+  uint8_t  pressAlphaPercent; // Фильтр давления BMP (1..50%, default 5%)
+  uint16_t zaletLimitC100;    // Дельта залёта в сотых °C (0.01..0.50 °C, default 10 -> 0.10°C)
+  uint8_t  pwmStartDuty;      // Стартовая скважность ШИМ (10..100%, default 80%)
+  uint8_t  pwmDecrStep;       // Шаг декремента ШИМ (1..25%, default 10%)
+  uint8_t  stabilizeTimeMin;  // Время отстоя в минутах (1..15 min, default 5 min)
+  uint8_t  solenoidHoldPwm;   // ШИМ удержания соленоида (10..255, default 40)
+  uint16_t cubeStopTempC10;   // Отсечка куба в десятых °C (80.0..100.0 °C, default 980 -> 98.0°C)
+};
 
-const unsigned long WAIT_STABILIZE_MS = 300000; // 5 минут отстоя (300 000 мс)
-const unsigned long PWM_PERIOD_MS     = 10000;  // Период ШИМ отбора (10 секунд)
+EEPROM_Settings settings;
+
+void loadDefaultSettings() {
+  settings.magic            = EEPROM_MAGIC;
+  settings.emaAlphaPercent  = 5;    // Temp Pt1000: 5% (проверено на практике)
+  settings.pressAlphaPercent= 3;    // Press BMP: 3% (стабильный порог залёта)
+  settings.zaletLimitC100   = 10;   // 0.10 °C
+  settings.pwmStartDuty     = 80;
+  settings.pwmDecrStep      = 10;
+  settings.stabilizeTimeMin = 5;
+  settings.solenoidHoldPwm  = 40;
+  settings.cubeStopTempC10  = 980;  // 98.0 °C
+}
+
+void saveSettingsToEEPROM() {
+  EEPROM.put(0, settings);
+}
+
+void initEEPROM() {
+  EEPROM.get(0, settings);
+  if (settings.magic != EEPROM_MAGIC) {
+    loadDefaultSettings();
+    saveSettingsToEEPROM();
+  }
+}
 
 // ============================================================================
-// --- ПЕРЕМЕННЫЕ СОСТОЯНИЯ ---
+// --- КОНСТАНТЫ И ПЕРЕМЕННЫЕ АВТОМАТИКИ ---
 // ============================================================================
+const uint8_t  PWM_MAX_VAL    = 255;
+const unsigned long BOOST_MS  = 150;
+const float    BARO_COEFF     = 0.037;  // °C на 1 мм рт. ст.
+const float    TEMP_BODY_ALARM= 50.0;   // Перегрев корпуса
+const unsigned long PWM_PERIOD_MS = 10000; // Цикл ШИМ 10 сек
+
 enum WorkMode { MANUAL, AUTO, PWM_AUTO };
 WorkMode currentMode = MANUAL;
 
 // Измерения
-float tempColumn = 0.00; 
-float cubeTemp   = -127.0; 
-float tempBody   = 0.00; 
-float pressmmHg  = 0.00; 
+float tempColumn    = 0.00;
+float cubeTemp      = -127.0;
+float tempBody      = 0.00;
+float pressmmHg     = 0.00;
+float pressFiltered = 0.00;
+
+// Фильтрация Pt1000
+unsigned long lastPtReadMs = 0;
+const unsigned long PT_READ_INTERVAL_MS = 200;
 
 // Базовые уставки
 float tempBase  = 0.00;
 float pressBase = 0.00;
 bool  isBaseSet = false;
 
-// Управление соленоидом
+// Соленоид
 bool          isSolenoidActive = false;
 bool          isBoosting       = false;
 unsigned long boostStartTime   = 0;
-
-uint8_t       pwmDutyPercent   = 80;    // Стартовая скважность (80%)
+uint8_t       pwmDutyPercent   = 80;
 unsigned long pwmCycleStartMs  = 0;
 
-// Флаги залёта и таймеры
+// Флаги залётов
 bool          isZaletActive    = false;
 bool          isStabilizing    = false;
 unsigned long stabilizeStartMs = 0;
 unsigned long lastZaletBeepMs  = 0;
-
-// Счётчик залётов
-uint16_t zaletCount = 0; // Счётчик залётов
-
-// Кнопки и Экран
-int           lastPressedButton = -1;
-uint8_t       currentPage       = 1;
-unsigned long pageSwitchMs      = 0;
-
-unsigned long lastDisplayUpdate = 0;
-unsigned long lastDSRequestTime = 0;
+uint16_t      zaletCount       = 0;
 
 // ============================================================================
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+// --- СОСТОЯНИЯ UI И УПРАВЛЕНИЯ ЭКРАНАМИ ---
+// ============================================================================
+enum UiState { VIEW_MODE, EDIT_MODE };
+UiState uiState = VIEW_MODE;
+
+uint8_t currentPage = 1;      // 1..11
+uint8_t selectedItem = 0;     // 0 — нет выбора, 1..N — выбранный элемент
+bool    blinkState = false;   // Для мигания символов
+unsigned long lastBlinkMs = 0;
+unsigned long lastActivityMs = 0; // Для таймаутов отмены и автовозврата Home
+
+// Переменная черновика для редактирования
+int32_t draftValue = 0;
+bool    confirmBlink = false; // Быстрое мигание при приеме
+unsigned long confirmStartMs = 0;
+
+// Опрос кнопок
+int  lastPressedBtn = -1;
+unsigned long btnHoldStartMs = 0;
+bool isAutoRepeat = false;
+
+// ============================================================================
+// --- ЗВУКОВЫЕ СИГНАЛЫ ---
 // ============================================================================
 void beep(uint16_t freq = 2000, uint16_t duration = 40) {
   tone(BUZZER_PIN, freq, duration);
 }
 
+void soundClick()   { beep(2400, 20); }
+void soundConfirm() { beep(2800, 50); delay(60); beep(3200, 70); }
+void soundCancel()  { beep(1200, 150); }
+void soundEmergency(){ tone(BUZZER_PIN, 1000, 400); }
+
+// ============================================================================
+// --- УПРАВЛЕНИЕ АППАРАТУРОЙ ---
+// ============================================================================
 void setupTimer2_Ultrasound() {
   pinMode(VALVE_PWM_PIN, OUTPUT);
-  TCCR2B = (TCCR2B & 0xF8) | 0x01; // 31.25 kHz
+  TCCR2B = (TCCR2B & 0xF8) | 0x01; // 31.25 kHz ШИМ (бесшумный)
   analogWrite(VALVE_PWM_PIN, 0);
 }
 
 float readPt1000() {
   uint8_t fault = maxThermo.readFault();
-  
   if (fault) {
     maxThermo.clearFault();
-    
-    // Если произошел сбой из-за наводки, перезанициализируем модуль по SPI
-    maxThermo.begin(MAX31865_2WIRE); 
-    return -999.0; // Сигнал ошибки для фильтра
+    maxThermo.begin(MAX31865_2WIRE);
+    return -999.0;
   }
-
   float rawTemp = maxThermo.temperature(RNOMINAL, RREF);
-
-  // Фильтрация заведомо нереальных бросков от наводок (например, > 150°C или < -20°C)
-  if (rawTemp < -20.0 || rawTemp > 150.0) {
-    return -999.0; 
-  }
-
+  if (rawTemp < -20.0 || rawTemp > 150.0) return -999.0;
   return rawTemp;
 }
 
-// Управление соленоидом (Форсирование -> Удержание)
 void setSolenoid(bool active) {
   if (active && !isSolenoidActive) {
     isSolenoidActive = true;
@@ -146,12 +192,148 @@ void setSolenoid(bool active) {
   }
 }
 
+// Получить количество редактируемых элементов на странице
+uint8_t getItemCountForPage(uint8_t page) {
+  switch (page) {
+    case 1:  return 3; // 1: T_base, 2: Delta T, 3: Mode
+    case 2:  return 0; // Информационная
+    case 3:  return 1; // EMA Filter Temp Alpha
+    case 4:  return 1; // EMA Filter Press Alpha
+    case 5:  return 1; // Delta T Limit
+    case 6:  return 1; // Start Duty
+    case 7:  return 1; // Decr Step
+    case 8:  return 1; // Stabilize Time
+    case 9:  return 1; // Solenoid Hold PWM
+    case 10: return 1; // Cube Stop Temp
+    case 11: return 1; // Factory Reset
+    default: return 0;
+  }
+}
+
+// Загрузить значение элемента в черновик
+void loadDraftValue() {
+  switch (currentPage) {
+    case 1:
+      if (selectedItem == 1) draftValue = 0; // Захват базы
+      else if (selectedItem == 2) draftValue = settings.zaletLimitC100;
+      else if (selectedItem == 3) draftValue = (int32_t)currentMode;
+      break;
+    case 3:  draftValue = settings.emaAlphaPercent; break;
+    case 4:  draftValue = settings.pressAlphaPercent; break;
+    case 5:  draftValue = settings.zaletLimitC100; break;
+    case 6:  draftValue = settings.pwmStartDuty; break;
+    case 7:  draftValue = settings.pwmDecrStep; break;
+    case 8:  draftValue = settings.stabilizeTimeMin; break;
+    case 9:  draftValue = settings.solenoidHoldPwm; break;
+    case 10: draftValue = settings.cubeStopTempC10; break;
+    case 11: draftValue = 0; // 0: NO, 1: YES
+      break;
+  }
+}
+
+// Сохранить черновик в рабочие переменные и EEPROM
+void applyDraftValue() {
+  switch (currentPage) {
+    case 1:
+      if (selectedItem == 1) { // Захват T_base
+        tempBase = tempColumn;
+        pressBase = pressmmHg;
+        isBaseSet = true;
+        isZaletActive = false;
+        isStabilizing = false;
+        zaletCount = 0;
+        digitalWrite(LED1_PIN, LOW);
+      } else if (selectedItem == 2) {
+        settings.zaletLimitC100 = constrain(draftValue, 1, 50);
+        saveSettingsToEEPROM();
+      } else if (selectedItem == 3) {
+        currentMode = (WorkMode)draftValue;
+        isZaletActive = false;
+        isStabilizing = false;
+        setSolenoid(false);
+        if (currentMode == PWM_AUTO) pwmDutyPercent = settings.pwmStartDuty;
+      }
+      break;
+    case 3:
+      settings.emaAlphaPercent = constrain(draftValue, 1, 50);
+      saveSettingsToEEPROM();
+      break;
+    case 4:
+      settings.pressAlphaPercent = constrain(draftValue, 1, 50);
+      saveSettingsToEEPROM();
+      break;
+    case 5:
+      settings.zaletLimitC100 = constrain(draftValue, 1, 50);
+      saveSettingsToEEPROM();
+      break;
+    case 6:
+      settings.pwmStartDuty = constrain(draftValue, 10, 100);
+      pwmDutyPercent = settings.pwmStartDuty;
+      saveSettingsToEEPROM();
+      break;
+    case 7:
+      settings.pwmDecrStep = constrain(draftValue, 1, 25);
+      saveSettingsToEEPROM();
+      break;
+    case 8:
+      settings.stabilizeTimeMin = constrain(draftValue, 1, 15);
+      saveSettingsToEEPROM();
+      break;
+    case 9:
+      settings.solenoidHoldPwm = constrain(draftValue, 10, 255);
+      saveSettingsToEEPROM();
+      break;
+    case 10:
+      settings.cubeStopTempC10 = constrain(draftValue, 800, 1000);
+      saveSettingsToEEPROM();
+      break;
+    case 11:
+      if (draftValue == 1) {
+        loadDefaultSettings();
+        saveSettingsToEEPROM();
+        pwmDutyPercent = settings.pwmStartDuty;
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print("RESET COMPLETED!");
+        soundConfirm();
+        delay(1500);
+        currentPage = 1;
+      }
+      break;
+  }
+}
+
+// Изменение значения черновика стрелками Влево/Вправо
+void modifyDraft(int delta) {
+  switch (currentPage) {
+    case 1:
+      if (selectedItem == 2) draftValue = constrain(draftValue + delta, 1, 50);
+      else if (selectedItem == 3) {
+        draftValue += delta;
+        if (draftValue > 2) draftValue = 0;
+        if (draftValue < 0) draftValue = 2;
+      }
+      break;
+    case 3: draftValue = constrain(draftValue + delta, 1, 50); break;
+    case 4: draftValue = constrain(draftValue + delta, 1, 50); break;
+    case 5: draftValue = constrain(draftValue + delta, 1, 50); break;
+    case 6: draftValue = constrain(draftValue + (delta * 5), 10, 100); break;
+    case 7: draftValue = constrain(draftValue + delta, 1, 25); break;
+    case 8: draftValue = constrain(draftValue + delta, 1, 15); break;
+    case 9: draftValue = constrain(draftValue + (delta * 5), 10, 255); break;
+    case 10: draftValue = constrain(draftValue + (delta * 5), 800, 1000); break;
+    case 11: draftValue = (draftValue == 0) ? 1 : 0; break;
+  }
+}
+
 // ============================================================================
 // --- SETUP ---
 // ============================================================================
 void setup() {
   Serial.begin(9600);
   Wire.begin();
+
+  initEEPROM();
+  pwmDutyPercent = settings.pwmStartDuty;
 
   setupTimer2_Ultrasound();
 
@@ -173,7 +355,6 @@ void setup() {
       dsSensors.setResolution(dsCubeAddr, 11);
       dsSensors.setWaitForConversion(false);
       dsSensors.requestTemperatures();
-      lastDSRequestTime = millis();
     }
   }
 
@@ -181,14 +362,14 @@ void setup() {
   lcd.backlight();
   bmpOK = bmp.begin();
 
-  lcd.setCursor(0, 0);
-  lcd.print(bmpOK ? "BMP: OK" : "BMP: ERR");
-  lcd.setCursor(9, 0);
-  lcd.print(dsFound ? "DS: OK" : "DS: ERR");
+  lcd.setCursor(0, 0); lcd.print(bmpOK ? "BMP: OK " : "BMP: ERR");
+  lcd.setCursor(9, 0); lcd.print(dsFound ? "DS: OK" : "DS: ERR");
 
-  beep(1000, 100);
-  delay(1200);
+  soundConfirm();
+  delay(1000);
   lcd.clear();
+  
+  lastActivityMs = millis();
 }
 
 // ============================================================================
@@ -201,128 +382,216 @@ void loop() {
   if (isSolenoidActive && isBoosting) {
     if (currentMillis - boostStartTime >= BOOST_MS) {
       isBoosting = false;
-      analogWrite(VALVE_PWM_PIN, PWM_HOLD_VAL);
+      analogWrite(VALVE_PWM_PIN, settings.solenoidHoldPwm);
     }
   }
 
-// 2. ЧТЕНИЕ ДАТЧИКОВ
-  
-  // Опрос Pt1000 ровно раз в 200 мс
+  // 2. ЧТЕНИЕ ДАТЧИКОВ И ФИЛЬТРАЦИЯ
+  // Pt1000
   if (currentMillis - lastPtReadMs >= PT_READ_INTERVAL_MS) {
     lastPtReadMs = currentMillis;
-    
     float freshTemp = readPt1000();
     if (freshTemp != -999.0) {
-      if (tempColumn == 0.0) {
-        tempColumn = freshTemp; // Первичная инициализация при старте
-      } else {
-        // Коэффициент 0.10 при опросе 5 раз в сек дает сглаживание примерно на 2 секунды.
-        // Чем меньше число (например, 0.05), тем сильнее и плавнее фильтр.
-        tempColumn = (tempColumn * 0.90) + (freshTemp * 0.10);
+      if (tempColumn == 0.0) tempColumn = freshTemp;
+      else {
+        float alpha = settings.emaAlphaPercent / 100.0;
+        tempColumn = (tempColumn * (1.0 - alpha)) + (freshTemp * alpha);
       }
     }
   }
 
+  // BMP180 / BMP080 (Давление)
   if (bmpOK) {
-    pressmmHg = bmp.readPressure() * 0.00750062;
-    tempBody  = bmp.readTemperature();
+    float rawPressmmHg = bmp.readPressure() * 0.00750062;
+    tempBody = bmp.readTemperature();
+
+    if (pressFiltered == 0.0) {
+      pressFiltered = rawPressmmHg;
+    } else {
+      float pAlpha = settings.pressAlphaPercent / 100.0;
+      pressFiltered = (pressFiltered * (1.0 - pAlpha)) + (rawPressmmHg * pAlpha);
+    }
+    pressmmHg = pressFiltered;
   }
 
-  if (dsFound && (currentMillis - lastDSRequestTime >= 500)) {
-    cubeTemp = dsSensors.getTempC(dsCubeAddr);
-    dsSensors.requestTemperatures();
-    lastDSRequestTime = currentMillis;
+  static unsigned long lastDsReadMs = 0;
+  if (currentMillis - lastDsReadMs >= 750) { // Запрос каждые 750 мс
+    lastDsReadMs = currentMillis;
+  
+    if (!dsFound) {
+      // Пробуем переинициализировать, если не нашли при старте
+      dsSensors.begin();
+      if (dsSensors.getDeviceCount() > 0 && dsSensors.getAddress(dsCubeAddr, 0)) {
+        dsFound = true;
+        dsSensors.setResolution(dsCubeAddr, 11);
+        dsSensors.setWaitForConversion(false);
+        dsSensors.requestTemperatures();
+      }
+    } else {
+      float rawCube = dsSensors.getTempC(dsCubeAddr);
+      // Проверяем на ошибку чтения (-127 и -85 — стандартные коды ошибок DS)
+      if (rawCube > -55.0 && rawCube < 125.0) {
+        cubeTemp = rawCube;
+      } else {
+        // Если датчик отвалился на лету
+        dsFound = false; 
+      }
+      dsSensors.requestTemperatures(); // Запрос следующего замера
+    }
   }
 
-  // 3. ОБРАБОТКА КНОПОК
-  int currentPressed = -1;
+  // 3. ТАЙМАУТЫ, МИГАНИЕ И АВТОВОЗВРАТ HOME
+  if (currentMillis - lastBlinkMs >= (confirmBlink ? 100 : 350)) {
+    lastBlinkMs = currentMillis;
+    blinkState = !blinkState;
+  }
+
+  if (confirmBlink && (currentMillis - confirmStartMs >= 1000)) {
+    confirmBlink = false;
+    uiState = VIEW_MODE;
+    selectedItem = 0;
+    lcd.clear();
+  }
+
+  // Таймаут отмены редактирования (10 сек)
+  if (uiState == EDIT_MODE && !confirmBlink) {
+    if (currentMillis - lastActivityMs >= 10000) {
+      soundCancel();
+      uiState = VIEW_MODE;
+      selectedItem = 0;
+      lcd.clear();
+    }
+  }
+
+  // Таймаут автовозврата на Главный экран (30 сек бездействия)
+  if (uiState == VIEW_MODE && currentPage != 1) {
+    if (currentMillis - lastActivityMs >= 30000) {
+      currentPage = 1;
+      selectedItem = 0;
+      soundClick();
+      lcd.clear();
+    }
+  }
+
+  // 4. ОБРАБОТКА КНОПОК
+  int activeBtn = -1;
   for (int i = 0; i < 5; i++) {
     if (digitalRead(BTN_PINS[i]) == LOW) {
-      currentPressed = i + 1;
+      activeBtn = i;
       break;
     }
   }
 
-if (currentPressed != -1 && currentPressed != lastPressedButton) {
-    beep(2400, 30);
+  if (activeBtn != -1) {
+    lastActivityMs = currentMillis; // Сброс таймера бездействия
 
-    switch (currentPressed) {
-      case 1: // Кнопка 1 (A0): Открытие/Закрытие клапана в ручном режиме
-        if (currentMode == MANUAL) {
-          setSolenoid(!isSolenoidActive);
+    if (activeBtn != lastPressedBtn) {
+      lastPressedBtn = activeBtn;
+      btnHoldStartMs = currentMillis;
+      isAutoRepeat   = false;
+
+      soundClick();
+
+      if (uiState == VIEW_MODE) {
+        if (activeBtn == BTN_RIGHT) {
+          currentPage = (currentPage >= 11) ? 1 : currentPage + 1;
+          lcd.clear();
+        } else if (activeBtn == BTN_LEFT) {
+          currentPage = (currentPage <= 1) ? 11 : currentPage - 1;
+          lcd.clear();
+        } else if (activeBtn == BTN_DOWN || activeBtn == BTN_UP) {
+          uint8_t count = getItemCountForPage(currentPage);
+          if (count > 0) {
+            uiState = EDIT_MODE;
+            selectedItem = (activeBtn == BTN_DOWN) ? 1 : count;
+            loadDraftValue();
+          }
+        } else if (activeBtn == BTN_SELECT) {
+          if (currentPage == 1 && currentMode == MANUAL) {
+            setSolenoid(!isSolenoidActive);
+          }
         }
-        break;
+      } else if (uiState == EDIT_MODE && !confirmBlink) {
+        uint8_t count = getItemCountForPage(currentPage);
 
-      case 2: // Кнопка 2 (A1): Переключение режима
-        if (currentMode == MANUAL) currentMode = AUTO;
-        else if (currentMode == AUTO) currentMode = PWM_AUTO;
-        else currentMode = MANUAL;
-
-        isZaletActive = false;
-        isStabilizing = false;
-        setSolenoid(false);
-        break;
-
-      case 3: // Кнопка 3 (A2): Фиксация T_base и P_base / Сброс аварии и залётов
-        tempBase   = tempColumn;
-        pressBase  = pressmmHg;
-        isBaseSet  = true;
-        isZaletActive = false;
-        isStabilizing = false;
-        zaletCount = 0; // <-- Сбрасываем счётчик при установке базы
-        digitalWrite(LED1_PIN, LOW);
-        break;
-
-      case 4: // Кнопка 4 (A3): Корректировка скважности ШИМ
-        if (pwmDutyPercent > 10) pwmDutyPercent -= 10;
-        else pwmDutyPercent = 80;
-        break;
-
-      case 5: // Кнопка 5 (D8): Переключение страниц дисплея
-        currentPage++;
-        if (currentPage > 3) currentPage = 1;
-        pageSwitchMs = currentMillis;
-        lcd.clear(); // Очищаем экран ТОЛЬКО один раз при смене страницы
-        break;
+        if (activeBtn == BTN_DOWN) {
+          if (selectedItem < count) {
+            selectedItem++;
+            loadDraftValue();
+          } else {
+            soundCancel();
+            uiState = VIEW_MODE;
+            selectedItem = 0;
+            lcd.clear();
+          }
+        } else if (activeBtn == BTN_UP) {
+          if (selectedItem > 1) {
+            selectedItem--;
+            loadDraftValue();
+          } else {
+            soundCancel();
+            uiState = VIEW_MODE;
+            selectedItem = 0;
+            lcd.clear();
+          }
+        } else if (activeBtn == BTN_RIGHT) {
+          modifyDraft(1);
+        } else if (activeBtn == BTN_LEFT) {
+          modifyDraft(-1);
+        } else if (activeBtn == BTN_SELECT) {
+          soundConfirm();
+          applyDraftValue();
+          confirmBlink = true;
+          confirmStartMs = currentMillis;
+        }
+      }
+    } else {
+      // Автоповтор при удержании Влево/Вправо
+      if (uiState == EDIT_MODE && !confirmBlink && (currentMillis - btnHoldStartMs >= 500)) {
+        if (currentMillis - btnHoldStartMs >= (isAutoRepeat ? 100 : 500)) {
+          btnHoldStartMs = currentMillis;
+          isAutoRepeat = true;
+          if (activeBtn == BTN_RIGHT) modifyDraft(1);
+          else if (activeBtn == BTN_LEFT) modifyDraft(-1);
+        }
+      }
     }
-    lastPressedButton = currentPressed;
-  } else if (currentPressed == -1) {
-    lastPressedButton = -1;
+  } else {
+    lastPressedBtn = -1;
   }
 
-  // 4. ЗАЩИТА: ПЕРЕГРЕВ КОРПУСА И ОКОНЧАНИЕ ОТБОРА ПО КУБУ
+  // 5. ЛОГИКА АВТОМАТИКИ
   if (bmpOK && tempBody >= TEMP_BODY_ALARM) {
     setSolenoid(false);
     digitalWrite(LED1_PIN, HIGH);
-    beep(3500, 100);
+    soundEmergency();
   }
 
-  if (dsFound && cubeTemp >= TEMP_CUBE_STOP && currentMode != MANUAL) {
+  if (dsFound && cubeTemp >= (settings.cubeStopTempC10 / 10.0) && currentMode != MANUAL) {
     setSolenoid(false);
     currentMode = MANUAL;
-    // Тройная финишная трель
-    for (int i = 0; i < 3; i++) { beep(3000, 200); delay(100); }
+    soundConfirm();
   }
 
-  // 5. ЛОГИКА АВТОМАТИКИ (AUTO И PWM_AUTO)
   if ((currentMode == AUTO || currentMode == PWM_AUTO) && isBaseSet) {
-    digitalWrite(LED2_PIN, HIGH); // Зеленый LED
+    digitalWrite(LED2_PIN, HIGH);
+    float targetLimit = settings.zaletLimitC100 / 100.0;
     float currentTTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF;
 
-    // Проверка залёта
-    if (tempColumn >= (currentTTarget + TEMP_ZALET_LIMIT)) {
+    if (tempColumn >= (currentTTarget + targetLimit)) {
       if (!isZaletActive) {
         isZaletActive = true;
         isStabilizing = false;
-        zaletCount++; // <-- Увеличиваем счётчик залётов
-        digitalWrite(LED1_PIN, HIGH); // Красный LED
+        zaletCount++;
+        digitalWrite(LED1_PIN, HIGH);
         beep(2400, 100);
         setSolenoid(false);
 
         if (currentMode == PWM_AUTO) {
-          if (pwmDutyPercent > 10) pwmDutyPercent -= 10;
-          else {
-            currentMode = MANUAL; // Скважность упала до нуля — финиш
+          if (pwmDutyPercent > settings.pwmDecrStep) {
+            pwmDutyPercent -= settings.pwmDecrStep;
+          } else {
+            currentMode = MANUAL; // Завершение отбора
           }
         }
       }
@@ -333,21 +602,19 @@ if (currentPressed != -1 && currentPressed != lastPressedButton) {
       }
     }
 
-    // Выдержка 5 минут отстоя
     if (isStabilizing) {
-      if (currentMillis - lastZaletBeepMs >= 60000) { // Пик раз в минуту
+      if (currentMillis - lastZaletBeepMs >= 60000) {
         beep(2000, 30);
         lastZaletBeepMs = currentMillis;
       }
 
-      if (currentMillis - stabilizeStartMs >= WAIT_STABILIZE_MS) {
+      if (currentMillis - stabilizeStartMs >= (settings.stabilizeTimeMin * 60000UL)) {
         isZaletActive = false;
         isStabilizing = false;
         digitalWrite(LED1_PIN, LOW);
       }
     }
 
-    // Исполнение отбора
     if (!isZaletActive && !isStabilizing) {
       if (currentMode == AUTO) {
         setSolenoid(true);
@@ -357,7 +624,6 @@ if (currentPressed != -1 && currentPressed != lastPressedButton) {
           pwmCycleStartMs = currentMillis;
           currentPwmMs = 0;
         }
-
         unsigned long openTimeMs = (PWM_PERIOD_MS * pwmDutyPercent) / 100;
         setSolenoid(currentPwmMs < openTimeMs);
       }
@@ -366,92 +632,181 @@ if (currentPressed != -1 && currentPressed != lastPressedButton) {
     digitalWrite(LED2_PIN, LOW);
   }
 
-// 6. ОБНОВЛЕНИЕ ДИСПЛЕЯ (Раз в 300 мс)
-  if (currentMillis - lastDisplayUpdate >= 300) {
-    lastDisplayUpdate = currentMillis;
+  // 6. ОТРИСОВКА ЭКРАНА LCD
+  lcd.setCursor(0, 0);
 
-    // Автовозврат на Стр 1 через 5 секунд
-    if (currentPage != 1 && (currentMillis - pageSwitchMs >= 5000)) {
-      currentPage = 1;
-      lcd.clear(); // Очищаем экран при автовозврате
-    }
+  switch (currentPage) {
+    case 1: { // Главный командный экран
+      if (uiState == EDIT_MODE && selectedItem == 1 && !blinkState) {
+        lcd.print("      ");
+      } else {
+        if (tempColumn < 100.0) lcd.print(" ");
+        lcd.print(tempColumn, 2);
+      }
+      lcd.print("/");
 
-    // ВНИМАНИЕ: lcd.clear() отсюда убран!
-
-    switch (currentPage) {
-      case 1: // Главный рабочий экран (Строка 1: "Pt:78.4  C:82.1 ")
-        lcd.setCursor(0, 0);
-        lcd.print("Pt:"); 
-        if (tempColumn > -50 && tempColumn < 200) {
-          lcd.print(tempColumn, 2);
-          if (tempColumn < 100.0) lcd.print(" "); // Пробел для стирания лишнего знака
+      if (uiState == EDIT_MODE && selectedItem == 2 && !blinkState) {
+        lcd.print("     ");
+      } else {
+        if (isBaseSet) {
+          float limit = (uiState == EDIT_MODE && selectedItem == 2) ? (draftValue / 100.0) : (settings.zaletLimitC100 / 100.0);
+          float tTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF + limit;
+          lcd.print(tTarget, 2);
         } else {
-          lcd.print("ERR ");
+          lcd.print("--.--");
         }
+      }
+      lcd.print(isBaseSet ? "C OK" : "C NO");
 
-        lcd.setCursor(8, 0);
-        lcd.print(" C:");
-        if (dsFound && cubeTemp > -50 && cubeTemp < 125) {
-          lcd.print(cubeTemp, 1);
-          lcd.print(" ");
-        } else {
-          lcd.print("ERR ");
-        }
+      lcd.setCursor(0, 1);
+      lcd.print("C:");
+      if (dsFound) lcd.print(cubeTemp, 1);
+      else lcd.print("ERR ");
 
-        // Строка 2: "MAN     V:OFF  "
-        lcd.setCursor(0, 1);
-        if (currentMode == MANUAL)        lcd.print("MAN   ");
-        else if (currentMode == AUTO)    lcd.print("AUTO  ");
+      lcd.setCursor(8, 1);
+      if (uiState == EDIT_MODE && selectedItem == 3 && !blinkState) {
+        lcd.print("    ");
+      } else {
+        WorkMode m = (uiState == EDIT_MODE && selectedItem == 3) ? (WorkMode)draftValue : currentMode;
+        if (m == MANUAL)     lcd.print("MAN ");
+        else if (m == AUTO)  lcd.print("AUTO");
         else {
-          lcd.print("P"); 
-          lcd.print(pwmDutyPercent); 
-          if (pwmDutyPercent < 100) lcd.print("% ");
-          else lcd.print("%");
+          lcd.print("P"); lcd.print(pwmDutyPercent); lcd.print("%");
+          if (pwmDutyPercent < 100) lcd.print(" ");
         }
+      }
 
-        lcd.setCursor(8, 1);
-        if (isBoosting)            lcd.print(" V:BOOST");
-        else if (isSolenoidActive) lcd.print(" V:HOLD ");
-        else                       lcd.print(" V:OFF  ");
-        break;
-
-      case 2: // Экран уставок и залётов
-        // --- Строка 1: Tbase и Счётчик залётов ---
-        lcd.setCursor(0, 0);
-        lcd.print("Tb:");
-        if (isBaseSet) {
-          lcd.print(tempBase, 2);
-        } else {
-          lcd.print("NONE ");
-        }
-
-        lcd.setCursor(9, 0);
-        lcd.print("Z:");
-        lcd.print(zaletCount);
-        lcd.print("   "); // Пробелы для затирания лишних цифр при сбросе
-
-        // --- Строка 2: Pbase ---
-        lcd.setCursor(0, 1);
-        lcd.print("Pb:");
-        if (isBaseSet) {
-          lcd.print(pressBase, 1);
-          lcd.print(" ");
-        } else {
-          lcd.print("NONE ");
-        }
-        break;
-
-      case 3: // Экран диагностики
-        lcd.setCursor(0, 0);
-        lcd.print("Pcurr:"); 
-        lcd.print(pressmmHg, 1); 
-        lcd.print(" mmHg  ");
-
-        lcd.setCursor(0, 1);
-        lcd.print("Tin:"); 
-        lcd.print(tempBody, 1); 
-        lcd.print(" C    ");
-        break;
+      lcd.setCursor(13, 1);
+      if (isBoosting)            lcd.print("BST");
+      else if (isSolenoidActive) lcd.print("ON ");
+      else                       lcd.print("OFF");
+      break;
     }
+
+    case 2: // Информационная
+      lcd.print("P:"); lcd.print(pressmmHg, 1); lcd.print("/");
+      if (isBaseSet) lcd.print(pressBase, 1);
+      else lcd.print("---.-");
+      lcd.print(" ");
+
+      lcd.setCursor(0, 1);
+      lcd.print("Tin:"); lcd.print(tempBody, 1); lcd.print("C ");
+      lcd.print(dsFound ? "DS:OK " : "DS:ERR");
+      break;
+
+    case 3: // EMA Temp Filter
+      lcd.print("EMA Temp Filter ");
+      lcd.setCursor(0, 1);
+      lcd.print("Weight A_T: ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("   ");
+      else {
+        int v = (uiState == EDIT_MODE) ? draftValue : settings.emaAlphaPercent;
+        if (v < 10) lcd.print(" ");
+        lcd.print(v); lcd.print("%");
+      }
+      lcd.print("   ");
+      break;
+
+    case 4: // EMA Press Filter
+      lcd.print("EMA Press Filter");
+      lcd.setCursor(0, 1);
+      lcd.print("Weight A_P: ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("   ");
+      else {
+        int v = (uiState == EDIT_MODE) ? draftValue : settings.pressAlphaPercent;
+        if (v < 10) lcd.print(" ");
+        lcd.print(v); lcd.print("%");
+      }
+      lcd.print("   ");
+      break;
+
+    case 5: // Zalet Limit
+      lcd.print("Zalet Limit     ");
+      lcd.setCursor(0, 1);
+      lcd.print("Delta T: ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("    ");
+      else {
+        float v = (uiState == EDIT_MODE) ? (draftValue / 100.0) : (settings.zaletLimitC100 / 100.0);
+        lcd.print(v, 2); lcd.print(" C");
+      }
+      lcd.print("  ");
+      break;
+
+    case 6: // PWM Start Duty
+      lcd.print("PWM Start Duty  ");
+      lcd.setCursor(0, 1);
+      lcd.print("Duty Val: ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("   ");
+      else {
+        int v = (uiState == EDIT_MODE) ? draftValue : settings.pwmStartDuty;
+        if (v < 100) lcd.print(" ");
+        lcd.print(v); lcd.print("%");
+      }
+      lcd.print("   ");
+      break;
+
+    case 7: // PWM Decr Step
+      lcd.print("PWM Decr Step   ");
+      lcd.setCursor(0, 1);
+      lcd.print("Step Val: ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("   ");
+      else {
+        int v = (uiState == EDIT_MODE) ? draftValue : settings.pwmDecrStep;
+        if (v < 10) lcd.print(" ");
+        lcd.print(v); lcd.print("%");
+      }
+      lcd.print("   ");
+      break;
+
+    case 8: // Stabilize Time
+      lcd.print("Stabilize Time  ");
+      lcd.setCursor(0, 1);
+      lcd.print("Pause:    ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("  ");
+      else {
+        int v = (uiState == EDIT_MODE) ? draftValue : settings.stabilizeTimeMin;
+        if (v < 10) lcd.print(" ");
+        lcd.print(v);
+      }
+      lcd.print(" min  ");
+      break;
+
+    case 9: // Solenoid Hold PWM
+      lcd.print("Solenoid Hold   ");
+      lcd.setCursor(0, 1);
+      lcd.print("Hold PWM: ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("   ");
+      else {
+        int v = (uiState == EDIT_MODE) ? draftValue : settings.solenoidHoldPwm;
+        if (v < 100) lcd.print(" ");
+        if (v < 10)  lcd.print(" ");
+        lcd.print(v);
+      }
+      lcd.print("   ");
+      break;
+
+    case 10: // Cube Stop Temp
+      lcd.print("Cube Stop Temp  ");
+      lcd.setCursor(0, 1);
+      lcd.print("T_stop:  ");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("    ");
+      else {
+        float v = (uiState == EDIT_MODE) ? (draftValue / 10.0) : (settings.cubeStopTempC10 / 10.0);
+        lcd.print(v, 1); lcd.print(" C");
+      }
+      lcd.print("  ");
+      break;
+
+    case 11: // Factory Reset
+      lcd.print("Factory Reset   ");
+      lcd.setCursor(0, 1);
+      lcd.print("Press SEL [");
+      if (uiState == EDIT_MODE && !blinkState) lcd.print("   ");
+      else {
+        int v = (uiState == EDIT_MODE) ? draftValue : 0;
+        lcd.print(v == 1 ? "YES" : "NO ");
+      }
+      lcd.print("] ");
+      break;
   }
 }
