@@ -214,8 +214,12 @@ uint8_t getItemCountForPage(uint8_t page) {
 void loadDraftValue() {
   switch (currentPage) {
     case 1:
-      if (selectedItem == 1) draftValue = 0; // Захват базы
-      else if (selectedItem == 2) draftValue = settings.zaletLimitC100;
+      if (selectedItem == 1) draftValue = 0; // Захват базовых T и P
+      else if (selectedItem == 2) {
+        // Загружаем текущую целевую температуру в сотых градуса °C
+        float tTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF + (settings.zaletLimitC100 / 100.0);
+        draftValue = (int32_t)lround(tTarget * 100.0);
+      }
       else if (selectedItem == 3) draftValue = (int32_t)currentMode;
       break;
     case 3:  draftValue = settings.emaAlphaPercent; break;
@@ -235,7 +239,7 @@ void loadDraftValue() {
 void applyDraftValue() {
   switch (currentPage) {
     case 1:
-      if (selectedItem == 1) { // Захват T_base
+      if (selectedItem == 1) { // Захват по факту
         tempBase = tempColumn;
         pressBase = pressmmHg;
         isBaseSet = true;
@@ -244,8 +248,14 @@ void applyDraftValue() {
         zaletCount = 0;
         digitalWrite(LED1_PIN, LOW);
       } else if (selectedItem == 2) {
-        settings.zaletLimitC100 = constrain(draftValue, 1, 50);
-        saveSettingsToEEPROM();
+        // Корректируем T_base так, чтобы T_target стала равна новому значению draftValue
+        float newTarget = draftValue / 100.0;
+        float currentDeltaP = (pressmmHg - pressBase) * BARO_COEFF;
+        float zaletLimit = settings.zaletLimitC100 / 100.0;
+        
+        // Вычисляем новую базовую температуру: T_base = T_target - deltaP - DeltaT
+        tempBase = newTarget - currentDeltaP - zaletLimit;
+        isBaseSet = true; // Фиксируем базу, если она не была задана
       } else if (selectedItem == 3) {
         currentMode = (WorkMode)draftValue;
         isZaletActive = false;
@@ -306,7 +316,10 @@ void applyDraftValue() {
 void modifyDraft(int delta) {
   switch (currentPage) {
     case 1:
-      if (selectedItem == 2) draftValue = constrain(draftValue + delta, 1, 50);
+      if (selectedItem == 2) {
+        // Изменяем целевую уставку с шагом 0.01 °C (в диапазоне 0..100 °C)
+        draftValue = constrain(draftValue + delta, 0, 10000);
+      }
       else if (selectedItem == 3) {
         draftValue += delta;
         if (draftValue > 2) draftValue = 0;
@@ -637,26 +650,31 @@ void loop() {
 
   switch (currentPage) {
     case 1: { // Главный командный экран
+      // Текущая температура царги
       if (uiState == EDIT_MODE && selectedItem == 1 && !blinkState) {
         lcd.print("      ");
       } else {
-        if (tempColumn < 100.0) lcd.print(" ");
+      if (tempColumn < 100.0) lcd.print(" ");
         lcd.print(tempColumn, 2);
       }
       lcd.print("/");
-
+      // Целевая температура залёта (редактируемая)
       if (uiState == EDIT_MODE && selectedItem == 2 && !blinkState) {
         lcd.print("     ");
       } else {
-        if (isBaseSet) {
-          float limit = (uiState == EDIT_MODE && selectedItem == 2) ? (draftValue / 100.0) : (settings.zaletLimitC100 / 100.0);
-          float tTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF + limit;
+      if (uiState == EDIT_MODE && selectedItem == 2) {
+        // Пока редактируем — отображаем черновик новой целевой температуры
+        float draftTarget = draftValue / 100.0;
+        lcd.print(draftTarget, 2);
+        } else if (isBaseSet) {
+          // В режиме просмотра — отображаем текущую целевую температуру
+          float tTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF + (settings.zaletLimitC100 / 100.0);
           lcd.print(tTarget, 2);
         } else {
           lcd.print("--.--");
         }
       }
-      lcd.print(isBaseSet ? "C OK" : "C NO");
+  lcd.print(isBaseSet ? "C OK" : "C NO");
 
       lcd.setCursor(0, 1);
       lcd.print("C:");
