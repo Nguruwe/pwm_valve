@@ -177,7 +177,7 @@ float readPt1000() {
   uint8_t fault = maxThermo.readFault();
   if (fault) {
     maxThermo.clearFault();
-    maxThermo.begin(MAX31865_2WIRE);
+    maxThermo.begin(MAX31865_4WIRE);
     return -999.0;
   }
   float rawTemp = maxThermo.temperature(RNOMINAL, RREF);
@@ -370,7 +370,7 @@ void setup() {
     pinMode(BTN_PINS[i], INPUT_PULLUP);
   }
 
-  maxThermo.begin(MAX31865_2WIRE);
+  maxThermo.begin(MAX31865_4WIRE);
 
   lcd.init();
   lcd.backlight();
