@@ -147,8 +147,30 @@ unsigned long btnHoldStartMs = 0;
 bool isAutoRepeat = false;
 
 // ============================================================================
+// --- HELPERS (ВЫЧИСЛЕНИЯ И КОНВЕРТАЦИЯ) ---
+// ============================================================================
+inline float getBaroOffset() {
+  if (!isBaseSet) return 0.0;
+  return (pressmmHg - pressBase) * BARO_COEFF;
+}
+
+inline float getTargetTemp() { return tempBase + getBaroOffset(); }
+
+inline float getZaletLimit() { return settings.zaletLimitC100 / 100.0f; }
+inline float getZaletThresholdTemp() { return getTargetTemp() + getZaletLimit(); }
+
+inline float getDraftAsFloat() { return draftValue / 100.0f; }
+
+inline float getEmaAlpha() { return settings.emaAlphaPercent / 100.0f; }
+inline float getPressAlpha() { return settings.pressAlphaPercent / 100.0f; }
+
+inline float getCubeStopBody() { return settings.cubeStopBodyC10 / 10.0f; }
+inline float getCubeStopTail() { return settings.cubeStopTailC10 / 10.0f; }
+
+// ============================================================================
 // --- ЗВУКОВЫЕ СИГНАЛЫ ---
 // ============================================================================
+
 void beep(uint16_t freq = 2000, uint16_t duration = 40) {
   long periodUs = 1000000L / freq;
   long cycles = ((long)freq * duration) / 1000L;
@@ -168,6 +190,7 @@ void soundEmergency() { beep(1000, 400); }
 // ============================================================================
 // --- УПРАВЛЕНИЕ АППАРАТУРОЙ ---
 // ============================================================================
+
 void setupTimer2_Ultrasound() {
   pinMode(VALVE_PWM_PIN, OUTPUT);
   TCCR2B = (TCCR2B & 0xF8) | 0x01; // 31.25 kHz ШИМ (бесшумный)
@@ -226,8 +249,7 @@ void loadDraftValue() {
     case 1:
       if (selectedItem == 1) draftValue = 0; // Захват базовых T и P
       else if (selectedItem == 2) {
-        float tTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF + (settings.zaletLimitC100 / 100.0);
-        draftValue = (int32_t)lround(tTarget * 100.0);
+        draftValue = (int32_t)lround(getZaletThresholdTemp() * 100.0);
       }
       else if (selectedItem == 3) draftValue = (int32_t)currentMode;
       break;
@@ -257,11 +279,9 @@ void applyDraftValue() {
         zaletCount = 0;
         digitalWrite(LED1_PIN, LOW);
       } else if (selectedItem == 2) {
-        float newTarget = draftValue / 100.0;
-        float currentDeltaP = (pressmmHg - pressBase) * BARO_COEFF;
-        float zaletLimit = settings.zaletLimitC100 / 100.0;
-        
-        tempBase = newTarget - currentDeltaP - zaletLimit;
+        float newTarget = draftValue / 100.0f;
+        // Из нового порога вычитаем поправку давления и дельту залёта:
+        tempBase = newTarget - getBaroOffset() - getZaletLimit();
         isBaseSet = true;
       } else if (selectedItem == 3) {
         currentMode = (WorkMode)draftValue;
@@ -411,22 +431,24 @@ void loop() {
     if (freshTemp != -999.0) {
       if (tempColumn == 0.0) tempColumn = freshTemp;
       else {
-        float alpha = settings.emaAlphaPercent / 100.0;
-        tempColumn = (tempColumn * (1.0 - alpha)) + (freshTemp * alpha);
+        tempColumn = (tempColumn * (1.0f - getEmaAlpha())) + (freshTemp * getEmaAlpha());
       }
     }
   }
 
   // BMP180 / BMP080 (Давление)
   if (bmpOK) {
-    float rawPressmmHg = bmp.readPressure() * 0.00750062;
+    float rawPressmmHg = bmp.readPressure() * 0.00750062f;
     tempBody = bmp.readTemperature();
 
-    if (pressFiltered == 0.0) {
-      pressFiltered = rawPressmmHg;
+    static bool isPressInit = false; // Флаг: было ли уже первое чтение?
+
+    if (!isPressInit) {
+      pressFiltered = rawPressmmHg;  // При первом старте просто берем сырое значение
+      isPressInit = true;            // Запоминаем, что инициализация прошла
     } else {
-      float pAlpha = settings.pressAlphaPercent / 100.0;
-      pressFiltered = (pressFiltered * (1.0 - pAlpha)) + (rawPressmmHg * pAlpha);
+      // В остальные разы спокойно сглаживаем по EMA
+      pressFiltered = (pressFiltered * (1.0f - getPressAlpha())) + (rawPressmmHg * getPressAlpha());
     }
     pressmmHg = pressFiltered;
   }
@@ -581,8 +603,7 @@ void loop() {
   }
 
   if (dsFound && currentMode != MANUAL) {
-    float stopLimit = (currentMode == AUTO) ? (settings.cubeStopBodyC10 / 10.0) 
-                                            : (settings.cubeStopTailC10 / 10.0);
+    float stopLimit = (currentMode == AUTO) ? getCubeStopBody() : getCubeStopTail();
     if (cubeTemp >= stopLimit) {
       setSolenoid(false);
       currentMode = MANUAL;
@@ -592,10 +613,8 @@ void loop() {
 
   if ((currentMode == AUTO || currentMode == PWM_AUTO) && isBaseSet) {
     digitalWrite(LED2_PIN, HIGH);
-    float targetLimit = settings.zaletLimitC100 / 100.0;
-    float currentTTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF;
 
-    if (tempColumn >= (currentTTarget + targetLimit)) {
+    if (tempColumn >= getZaletThresholdTemp()) {
       if (!isZaletActive) {
         isZaletActive = true;
         isStabilizing = false;
@@ -666,21 +685,29 @@ void loop() {
         lcd.print("     ");
       } else {
         if (uiState == EDIT_MODE && selectedItem == 2) {
-          float draftTarget = draftValue / 100.0;
+          float draftTarget = getDraftAsFloat();
           lcd.print(draftTarget, 2);
         } else if (isBaseSet) {
-          float tTarget = tempBase + (pressmmHg - pressBase) * BARO_COEFF + (settings.zaletLimitC100 / 100.0);
-          lcd.print(tTarget, 2);
+          //lcd.print(getTargetTemp(), 2);
+          lcd.print(getZaletThresholdTemp(), 2);
         } else {
           lcd.print("--.--");
         }
       }
       lcd.print(isBaseSet ? "C OK" : "C NO");
-
+      
       lcd.setCursor(0, 1);
-      lcd.print("C:");
-      if (dsFound) lcd.print(cubeTemp, 1);
-      else lcd.print("ERR ");
+      lcd.print("C: ");
+      //lcd.print(" ");
+      if (dsFound) {
+        if (cubeTemp > -50.0f && cubeTemp < 100.0f) {
+          lcd.print(cubeTemp, 1);
+        } else {
+          lcd.print("ERR ");
+        }
+        } else {
+          lcd.print("NoDS ");
+        }
 
       lcd.setCursor(8, 1);
       if (uiState == EDIT_MODE && selectedItem == 3 && !blinkState) {
@@ -745,7 +772,7 @@ void loop() {
       lcd.print("Delta T: ");
       if (uiState == EDIT_MODE && !blinkState) lcd.print("    ");
       else {
-        float v = (uiState == EDIT_MODE) ? (draftValue / 100.0) : (settings.zaletLimitC100 / 100.0);
+        float v = (uiState == EDIT_MODE) ? getDraftAsFloat() : getZaletLimit();
         lcd.print(v, 2); lcd.print(" C");
       }
       lcd.print("  ");
@@ -810,7 +837,7 @@ void loop() {
       lcd.print("T_body:  ");
       if (uiState == EDIT_MODE && !blinkState) lcd.print("    ");
       else {
-        float v = (uiState == EDIT_MODE) ? (draftValue / 10.0) : (settings.cubeStopBodyC10 / 10.0);
+        float v = (uiState == EDIT_MODE) ? (draftValue / 10.0f) : getCubeStopBody();
         lcd.print(v, 1); lcd.print(" C");
       }
       lcd.print("  ");
@@ -822,7 +849,7 @@ void loop() {
       lcd.print("T_tail:  ");
       if (uiState == EDIT_MODE && !blinkState) lcd.print("    ");
       else {
-        float v = (uiState == EDIT_MODE) ? (draftValue / 10.0) : (settings.cubeStopTailC10 / 10.0);
+        float v = (uiState == EDIT_MODE) ? (draftValue / 10.0f) : getCubeStopTail();
         lcd.print(v, 1); lcd.print(" C");
       }
       lcd.print("  ");
