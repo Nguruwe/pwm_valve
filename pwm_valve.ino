@@ -403,7 +403,7 @@ void setup() {
   bmpOK = bmp.begin();
 
   lcd.setCursor(0, 0); lcd.print(bmpOK ? "BMP: OK " : "BMP: ERR");
-  lcd.setCursor(9, 0); lcd.print("DS: WAIT");
+  lcd.setCursor(0, 1); lcd.print("DS: WAIT");
 
   soundConfirm();
   delay(1000);
@@ -683,7 +683,7 @@ void loop() {
       if (uiState == EDIT_MODE && selectedItem == 1 && !blinkState) {
         lcd.print("      ");
       } else {
-        if (tempColumn < 100.0) lcd.print(" ");
+        if (tempColumn < 100.0) lcd.print("");
         lcd.print(tempColumn, 2);
       }
       lcd.print("/");
