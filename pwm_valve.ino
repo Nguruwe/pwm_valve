@@ -333,6 +333,9 @@ void applyDraftValue() {
       break;
     case 12:
       if (draftValue == 1) {
+        isBaseSet = false;
+        isZaletActive = false;
+        setSolenoid(false);
         loadDefaultSettings();
         saveSettingsToEEPROM();
         pwmDutyPercent = settings.pwmStartDuty;
@@ -582,7 +585,8 @@ void loop() {
         }
       }
     } else {
-      if (uiState == EDIT_MODE && !confirmBlink && (currentMillis - btnHoldStartMs >= 500)) {
+
+      if (uiState == EDIT_MODE && !confirmBlink) {
         if (currentMillis - btnHoldStartMs >= (isAutoRepeat ? 100 : 500)) {
           btnHoldStartMs = currentMillis;
           isAutoRepeat = true;
@@ -590,6 +594,8 @@ void loop() {
           else if (activeBtn == BTN_LEFT) modifyDraft(-1);
         }
       }
+
+      
     }
   } else {
     lastPressedBtn = -1;
@@ -697,17 +703,17 @@ void loop() {
       lcd.print(isBaseSet ? "C OK" : "C NO");
       
       lcd.setCursor(0, 1);
-      lcd.print("C: ");
-      //lcd.print(" ");
+      lcd.print("C:");
       if (dsFound) {
-        if (cubeTemp > -50.0f && cubeTemp < 100.0f) {
-          lcd.print(cubeTemp, 1);
+        if (cubeTemp >= 0.0f && cubeTemp < 100.0f) lcd.print(" "); // выравнивание
+          if (cubeTemp > -50.0f && cubeTemp < 125.0f) {
+            lcd.print(cubeTemp, 1);
+          } else {
+            lcd.print("ERR ");
+          }
         } else {
-          lcd.print("ERR ");
-        }
-        } else {
-          lcd.print("NoDS ");
-        }
+        lcd.print("NoDS");
+      }
 
       lcd.setCursor(8, 1);
       if (uiState == EDIT_MODE && selectedItem == 3 && !blinkState) {
