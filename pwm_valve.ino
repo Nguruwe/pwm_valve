@@ -683,7 +683,7 @@ void loop() {
       if (uiState == EDIT_MODE && selectedItem == 1 && !blinkState) {
         lcd.print("      ");
       } else {
-        if (tempColumn < 100.0) lcd.print("");
+        if (tempColumn < 100.0) lcd.print(" ");
         lcd.print(tempColumn, 2);
       }
       lcd.print("/");
