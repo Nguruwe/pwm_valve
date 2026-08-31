@@ -637,12 +637,11 @@ void loop() {
           }
         }
       }
-    } else {
-      if (isZaletActive && !isStabilizing) {
+    } else if (isZaletActive && !isStabilizing && tempColumn <= getTargetTemp()) {
         isStabilizing = true;
         stabilizeStartMs = currentMillis;
       }
-    }
+    
 
     if (isStabilizing) {
       if (currentMillis - lastZaletBeepMs >= 60000) {
